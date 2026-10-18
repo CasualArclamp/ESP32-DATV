@@ -1,0 +1,60 @@
+name: Pages
+
+# Publishes site/ with the firmware bundled in the app (app/assets/firmware) as ESP Web Tools
+# manifests, so boards can be flashed from the browser.
+on:
+  push:
+    branches: [main]
+    paths: ['site/**', 'app/assets/firmware/**', 'app/pubspec.yaml', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Assemble the site
+        run: |
+          mkdir -p _site/firmware/c3 _site/firmware/tdeck
+          cp site/* _site/
+          cp app/assets/firmware/*.bin _site/firmware/c3/
+          cp app/assets/firmware/tdeck/*.bin _site/firmware/tdeck/
+          python3 - <<'EOF'
+          import json, re
+          app = re.search(r'^version:\s*([^+\s]+)', open('app/pubspec.yaml').read(), re.M)[1]
+          for src, dst, family, name in [
+              ('app/assets/firmware', 'c3', 'ESP32-C3', 'ESP32-DATV transmitter'),
+              ('app/assets/firmware/tdeck', 'tdeck', 'ESP32-S3', 'ESP32-DATV T-Deck'),
+          ]:
+              m = json.load(open(f'{src}/manifest.json'))
+              out = {
+                  'name': name,
+                  'version': f"{app} ({m['info']}, {m['source_commit']})",
+                  'new_install_prompt_erase': True,
+                  'builds': [{
+                      'chipFamily': family,
+                      'parts': [{'path': i['file'], 'offset': i['offset']} for i in m['images']],
+                  }],
+              }
+              json.dump(out, open(f'_site/firmware/{dst}/manifest.json', 'w'), indent=2)
+          EOF
+          find _site -type f | sort
+      - uses: actions/upload-pages-artifact@v4
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32-DATV Flasher</title>
+<meta name="description" content="Install the ESP32-DATV firmware on an ESP32-C3 or a LilyGO T-Deck from the browser.">
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --text: #1b1f24; --muted: #5b6470; --line: #dde1e6;
+  --accent: #e8730c; --accent-text: #ffffff; --warn-bg: #fff4e5; --warn-line: #f0c48a;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151a; --card: #1b2028; --text: #e7eaee; --muted: #9aa4b0; --line: #2c333d;
+    --accent: #f08a2c; --accent-text: #12151a; --warn-bg: #2a2116; --warn-line: #6b4a1f;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main { max-width: 860px; margin: 0 auto; padding: 32px 16px 48px; }
+h1 { font-size: 2rem; margin: 0 0 4px; }
+h2 { font-size: 1.25rem; margin: 0 0 8px; }
+p.lead { color: var(--muted); margin: 0 0 28px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+.card p { margin: 0 0 14px; color: var(--muted); }
+.ver { font-size: .85rem; color: var(--muted); margin-bottom: 14px; font-family: ui-monospace, monospace; }
+esp-web-install-button button[slot="activate"] {
+  background: var(--accent); color: var(--accent-text); border: 0; border-radius: 8px;
+  padding: 10px 18px; font: inherit; font-weight: 600; cursor: pointer;
+}
+.unsupported, .notallowed { color: var(--muted); font-size: .95rem; }
+section { margin-top: 32px; }
+ol, ul { padding-left: 22px; margin: 0; }
+li { margin-bottom: 6px; }
+.note { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 10px; padding: 14px 16px; margin-top: 16px; }
+code { font-family: ui-monospace, monospace; font-size: .9em; }
+a { color: var(--accent); }
+footer { margin-top: 40px; color: var(--muted); font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ESP32-DATV</h1>
+  <p class="lead">DVB-S and DVB-S2 amateur television from the 2.4 GHz radio of an ESP32. Install the firmware
+    straight from this page over USB.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h2>LilyGO T-Deck</h2>
+      <p>Standalone transmitter and receiver (ESP32-S3) with picture and sound on the T-Deck itself.</p>
+      <div class="ver" id="ver-tdeck">&nbsp;</div>
+      <esp-web-install-button manifest="firmware/tdeck/manifest.json">
+        <button slot="activate">Install on T-Deck</button>
+        <span slot="unsupported" class="unsupported">This browser cannot flash over USB. Use Chrome or Edge on a computer.</span>
+        <span slot="not-allowed" class="notallowed">Flashing needs this page over HTTPS.</span>
+      </esp-web-install-button>
+    </div>
+    <div class="card">
+      <h2>ESP32-C3 transmitter</h2>
+      <p>The USB transmitter driven by the ESP32-DATV app on Linux, Windows or Android.</p>
+      <div class="ver" id="ver-c3">&nbsp;</div>
+      <esp-web-install-button manifest="firmware/c3/manifest.json">
+        <button slot="activate">Install on ESP32-C3</button>
+        <span slot="unsupported" class="unsupported">This browser cannot flash over USB. Use Chrome or Edge on a computer.</span>
+        <span slot="not-allowed" class="notallowed">Flashing needs this page over HTTPS.</span>
+      </esp-web-install-button>
+    </div>
+  </div>
+
+  <section>
+    <h2>How to install</h2>
+    <ol>
+      <li>Open this page in Chrome or Edge on a computer (Windows, macOS or Linux).</li>
+      <li>Connect the board with a USB-C data cable. On the T-Deck, switch it on.</li>
+      <li>Click the install button for your board and choose its port in the list
+        (it shows as <code>USB JTAG/serial debug unit</code>).</li>
+      <li>When asked, choose <b>Erase device</b> if the board ran other firmware before (MeshCore, Meshtastic and so on).</li>
+      <li>Wait until the page reports that the installation is complete. The board restarts by itself.</li>
+    </ol>
+    <div class="note">
+      <b>The port does not appear, or the connection fails?</b> Start the board in download mode:
+      hold the BOOT button (on the T-Deck: press and hold the trackball), plug in the cable or tap RESET,
+      then release it and click install again. After installing, unplug and plug in the board once.
+    </div>
+  </section>
+
+  <section>
+    <h2>Flashing by hand</h2>
+    <p>The <a href="https://github.com/x1watt/ESP32-DATV/releases/latest">release page</a> has complete
+      T-Deck images. They contain bootloader, partition table and program, so they go to address <code>0x0</code>:</p>
+    <p><code>esptool.py --chip esp32s3 write_flash 0x0 tdeck-datv-&lt;version&gt;-tdeck-16MB.bin</code></p>
+  </section>
+
+  <footer>
+    <a href="https://github.com/x1watt/ESP32-DATV">Source code and app downloads on GitHub</a>.
+    Flashing uses <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>.
+  </footer>
+</main>
+<script>
+for (const [id, dir] of [['ver-tdeck', 'tdeck'], ['ver-c3', 'c3']]) {
+  fetch(`firmware/${dir}/manifest.json`).then(r => r.json()).then(m => {
+    document.getElementById(id).textContent = `Firmware ${m.version}`;
+  }).catch(() => {});
+}
+</script>
+</body>
+</html>

@@ -142,9 +142,13 @@ Build and flash (ESP-IDF 6.1):
 cd tdeck
 idf.py set-target esp32s3
 idf.py -p /dev/ttyACM0 build flash
-# once, to start the display interface on a T-Deck (other boards stay console-only):
-echo "BOARD tdeck" > /dev/ttyACM0
 ```
+
+Without building: install it from the browser at <https://x1watt.github.io/ESP32-DATV/> (Chrome or Edge),
+or write the complete image from the [releases](https://github.com/x1watt/ESP32-DATV/releases) at address 0x0:
+`esptool.py --chip esp32s3 write_flash 0x0 tdeck-datv-<version>-tdeck-16MB.bin`. The app's Device page installs it too.
+The T-Deck build starts the display interface; on a T-Deck that ran an older build headless, send `BOARD tdeck`
+over USB once.
 
 For an ESP32-S3 with 4 MB flash and quad PSRAM (used here as a second station without a display):
 
