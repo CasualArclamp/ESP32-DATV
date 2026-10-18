@@ -2,12 +2,13 @@
 #include <string.h>
 #include "board.h"
 #include "nvs.h"
+#include "sdkconfig.h"
 
 settings_t settings;
 
 static const settings_t defaults = {
     .freq_khz = 2370000, .baud = 66000, .fec = 0, .audio = 1, .amp = 150, .rx_gain = 30, .ppm_x10 = 0,
-    .lcd = LCD_SWAP_XY | LCD_MIRROR_X | LCD_INVERT, .call = "NOCALL", .text = "", .board = "",
+    .lcd = LCD_SWAP_XY | LCD_MIRROR_X | LCD_INVERT, .call = "NOCALL", .text = "", .board = CONFIG_DATV_DEFAULT_BOARD,
 };
 
 void settings_load(void) {

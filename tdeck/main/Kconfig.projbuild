@@ -1,0 +1,10 @@
+menu "DATV"
+
+config DATV_DEFAULT_BOARD
+    string "Board when none is stored"
+    default "tdeck"
+    help
+        Board setting used while NVS holds none (after a full flash or an erase): "tdeck" starts
+        the screen UI, "" runs headless on the USB console. The sender profile sets "".
+
+endmenu

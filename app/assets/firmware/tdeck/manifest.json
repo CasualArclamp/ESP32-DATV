@@ -2,7 +2,7 @@
   "chip": "esp32s3",
   "info": "TDECKDATV 0",
   "version": 0,
-  "source_commit": "915072b",
+  "source_commit": "fccb998",
   "idf": "v6.1",
   "flash_mode": "dio",
   "flash_freq": "80m",
@@ -10,6 +10,6 @@
   "images": [
     {"file": "bootloader.bin", "offset": 0, "md5": "31120a3fb1ecfc5a3d64f63f7695f5e6"},
     {"file": "partition-table.bin", "offset": 32768, "md5": "2b4b4b97d8ee2913058233539ae5c9e3"},
-    {"file": "tdeck_datv.bin", "offset": 65536, "md5": "7f3fa3c0c2e1de721c5beba9121eecac"}
+    {"file": "tdeck_datv.bin", "offset": 65536, "md5": "a4806e1505fe6150cd713a887e41ee04"}
   ]
 }
