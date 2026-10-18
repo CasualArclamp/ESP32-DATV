@@ -35,7 +35,7 @@ class DevicePage extends StatelessWidget {
             icon: const Icon(Icons.refresh),
           ),
         ]),
-        if (c.ports.isEmpty) const Text('No serial port found. Connect the ESP32-C3 with a USB-C data cable.'),
+        if (c.ports.isEmpty) const Text('No serial port found. Connect the ESP32-C3 or T-Deck with a USB-C data cable.'),
         Wrap(spacing: 8, runSpacing: 8, children: [
           if (!connected)
             FilledButton.icon(
@@ -60,20 +60,21 @@ class DevicePage extends StatelessWidget {
         _BoardStatus(c: c),
       ]),
       Section(title: 'Firmware', children: [
-        Text(fw == null ? 'No firmware bundled.' : 'Bundled DATV firmware ${fw.describe}'),
+        Text(fw.isEmpty ? 'No firmware bundled.' : 'Bundled DATV firmware: ${fw.map((b) => b.describe).join(', ')}'),
         if (c.flashProgress != null) ...[
           LinearProgressIndicator(value: c.flashProgress),
           Text('${c.flashStage ?? ''} ${(100 * (c.flashProgress ?? 0)).toStringAsFixed(0)} %'),
         ],
         Wrap(spacing: 8, children: [
           FilledButton.tonalIcon(
-            onPressed: !connected || busy || fw == null ? null : () => _confirmFlash(context),
+            onPressed: !connected || busy || fw.isEmpty ? null : () => _confirmFlash(context),
             icon: const Icon(Icons.system_update_alt),
-            label: Text(c.board == BoardState.datv ? 'Reinstall firmware' : 'Install firmware'),
+            label: Text(c.board == BoardState.datv || c.board == BoardState.tdeck ? 'Reinstall firmware' : 'Install firmware'),
           ),
         ]),
-        const Text('Flashing uses the ESP32-C3 ROM bootloader over the same USB cable. If it does not answer, '
-            'hold BOOT, tap RESET (or replug), release BOOT and try again.'),
+        const Text('Flashing uses the ESP32 ROM bootloader over the same USB cable and picks the firmware for the '
+            'chip it finds: an ESP32-C3 gets the transmitter firmware, an ESP32-S3 the T-Deck firmware. If it does '
+            'not answer, hold BOOT (the trackball on the T-Deck), tap RESET (or replug), release BOOT and try again.'),
       ]),
       if (c.message != null) InfoBanner(c.message!, error: c.messageIsError),
     ]);
@@ -90,7 +91,8 @@ class DevicePage extends StatelessWidget {
       builder: (ctx) => AlertDialog(
         title: const Text('Install the DATV firmware?'),
         content: Text('This overwrites the program on the board connected to ${c.selectedPort?.name}. '
-            'Make sure this is the ESP32-C3 you want to use as the transmitter.'),
+            'An ESP32-C3 gets the transmitter firmware, an ESP32-S3 the T-Deck firmware. Make sure this is the '
+            'board you want to use.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
           FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Install')),
@@ -113,11 +115,14 @@ class _BoardStatus extends StatelessWidget {
       BoardState.connecting => (Icons.hourglass_top, cs.primary, 'Checking the board...'),
       BoardState.flashing => (Icons.system_update_alt, cs.primary, 'Installing the firmware...'),
       BoardState.datv => (Icons.check_circle, Colors.green, 'Valid DATV firmware: ${c.boardLine ?? ''}'),
+      BoardState.tdeck => (Icons.check_circle, Colors.green, 'T-Deck DATV firmware: ${c.boardLine ?? ''}. It transmits '
+          'and receives on its own; use its screen and keyboard.'),
       BoardState.noAnswer => (Icons.help_outline, Colors.orange, 'No answer from the DATV firmware. If this is your '
-          'ESP32-C3, install the firmware below; "Identify chip" checks the chip type first.'),
-      BoardState.bareC3 => (Icons.warning_amber, Colors.orange, 'ESP32-C3 found, but without the DATV firmware. Install it below.'),
-      BoardState.unknown => (Icons.help_outline, cs.error, 'No answer from the DATV firmware or the ESP32-C3 bootloader. '
-          'This may not be an ESP32-C3, or it needs a reset.'),
+          'ESP32-C3 or T-Deck, install the firmware below; "Identify chip" checks the chip type first.'),
+      BoardState.bareChip => (Icons.warning_amber, Colors.orange, '${c.boardLine ?? 'ESP32'} found, but without the DATV '
+          'firmware. Install it below.'),
+      BoardState.unknown => (Icons.help_outline, cs.error, 'No answer from the DATV firmware or the ESP32 bootloader. '
+          'This may not be an ESP32-C3 or ESP32-S3, or it needs a reset.'),
     };
     return Row(children: [
       Icon(icon, color: color),

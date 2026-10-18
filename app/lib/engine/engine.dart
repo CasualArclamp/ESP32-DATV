@@ -53,15 +53,18 @@ class SourceSpec {
 }
 
 class HelloResult {
-  HelloResult({this.version, this.line, this.rom});
+  HelloResult({this.version, this.line, this.chip, this.tdeck = false});
 
   /// Firmware version, null if the board does not run the DATV firmware.
   final int? version;
   final String? line;
 
-  /// True if an ESP32-C3 ROM loader answered (a C3 without DATV firmware), false if not,
-  /// null if it was not probed.
-  final bool? rom;
+  /// The chip whose ROM loader answered ("ESP32-C3", "ESP32-S3") on a board without DATV
+  /// firmware, null if none did or it was not probed.
+  final String? chip;
+
+  /// The board runs the standalone T-Deck firmware.
+  final bool tdeck;
 }
 
 /// Live status during a transmission.
@@ -333,19 +336,28 @@ class DeviceSession implements MediaSink {
   }
 
   /// Checks for the DATV firmware (INFO). With [probeRom], a board without it is reset into
-  /// the ROM loader to see whether it is an ESP32-C3 (this restarts the board).
+  /// the ROM loader to see which chip it is (this restarts the board).
   Future<HelloResult> hello({bool probeRom = false}) async {
     final r = await _request({'cmd': 'hello', 'probeRom': probeRom}, {'hello'});
-    return HelloResult(version: r['version'] as int?, line: r['line'] as String?, rom: r['rom'] as bool?);
+    return HelloResult(
+        version: r['version'] as int?, line: r['line'] as String?, chip: r['chip'] as String?, tdeck: r['tdeck'] == true);
   }
 
-  Future<HelloResult> flash(List<FlashImage> images, {FlashProgress? progress}) async {
+  /// Flashes the target that matches the chip on the board.
+  Future<HelloResult> flash(List<FlashTarget> targets, {FlashProgress? progress}) async {
     final r = await _request(
       {
         'cmd': 'flash',
-        'images': [
-          for (final i in images)
-            {'name': i.name, 'offset': i.offset, 'md5': i.md5, 'data': TransferableTypedData.fromList([i.data])},
+        'targets': [
+          for (final t in targets)
+            {
+              'chip': t.chip,
+              'flashSize': t.flashSize,
+              'images': [
+                for (final i in t.images)
+                  {'name': i.name, 'offset': i.offset, 'md5': i.md5, 'data': TransferableTypedData.fromList([i.data])},
+              ],
+            },
         ],
       },
       {'flashed'},
@@ -353,7 +365,7 @@ class DeviceSession implements MediaSink {
         if (m['ev'] == 'flashProgress') progress?.call(m['stage'] as String, (m['f'] as num).toDouble());
       },
     );
-    return HelloResult(version: r['version'] as int?, line: r['line'] as String?);
+    return HelloResult(version: r['version'] as int?, line: r['line'] as String?, tdeck: r['tdeck'] == true);
   }
 
   // ---------------------------------------------------------------- transmission

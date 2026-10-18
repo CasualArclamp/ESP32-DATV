@@ -1,5 +1,5 @@
-/// Flashes the ESP32-C3 through its ROM serial bootloader (a small subset of esptool:
-/// SLIP framing, SYNC, chip check, SPI attach, compressed writes, MD5 verification).
+/// Flashes an ESP32-C3 or ESP32-S3 through its ROM serial bootloader (a small subset of
+/// esptool: SLIP framing, SYNC, chip check, SPI attach, compressed writes, MD5 verification).
 library;
 
 import 'dart:convert';
@@ -27,10 +27,45 @@ class FlashImage {
   final String? md5;
 }
 
+/// The images for one chip (one bundled manifest).
+class FlashTarget {
+  const FlashTarget(this.chip, this.flashSize, this.images);
+
+  /// Chip id as in the manifest ("esp32c3", "esp32s3").
+  final String chip;
+  final int flashSize;
+  final List<FlashImage> images;
+}
+
+/// Parses a manifest flash size ("4MB", "16MB").
+int parseFlashSize(String? s) {
+  final m = RegExp(r'^(\d+)MB$').firstMatch(s ?? '');
+  return m == null ? 4 * 1024 * 1024 : int.parse(m[1]!) * 1024 * 1024;
+}
+
+class EspChip {
+  const EspChip(this.id, this.name, this.magic, this.chipId);
+  final String id, name;
+
+  /// Values of the chip magic register.
+  final List<int> magic;
+
+  /// Chip id from GET_SECURITY_INFO (newer ROMs).
+  final int chipId;
+}
+
+/// ESP32-C3 chip magic values (ECO0..ECO3+), from esptool.
+const List<int> esp32c3Magic = [0x6921506F, 0x1B31506F, 0x4881606F, 0x4361606F];
+
+const EspChip esp32c3 = EspChip('esp32c3', 'ESP32-C3', esp32c3Magic, 5);
+const EspChip esp32s3 = EspChip('esp32s3', 'ESP32-S3', [0x9], 9);
+const List<EspChip> knownChips = [esp32c3, esp32s3];
+
 typedef FlashProgress = void Function(String stage, double fraction);
 
 // ROM loader opcodes
 const int _opSync = 0x08;
+const int _opWriteReg = 0x09;
 const int _opReadReg = 0x0A;
 const int _opSpiSetParams = 0x0B;
 const int _opSpiAttach = 0x0D;
@@ -38,11 +73,20 @@ const int _opDeflBegin = 0x10;
 const int _opDeflData = 0x11;
 const int _opDeflEnd = 0x12;
 const int _opMd5 = 0x13;
+const int _opSecurityInfo = 0x14;
 
 const int _chipMagicReg = 0x40001000;
 
-/// ESP32-C3 chip magic values (ECO0..ECO3+), from esptool.
-const List<int> esp32c3Magic = [0x6921506F, 0x1B31506F, 0x4881606F, 0x4361606F];
+// ESP32-S3 RTC watchdogs (esptool's esp32s3.py). They keep running in the ROM loader when
+// it was entered over USB-Serial-JTAG and would reset the chip during a long flash.
+const int _s3UartDevBufNo = 0x3FCEF14C;
+const int _s3UartUsbJtagSerial = 4;
+const int _s3RtcWdtConfig0 = 0x60008098;
+const int _s3RtcWdtProtect = 0x600080B0;
+const int _s3RtcSwdConf = 0x600080B4;
+const int _s3RtcSwdProtect = 0x600080B8;
+const int _rtcWdtKey = 0x50D83AA1;
+const int _rtcSwdKey = 0x8F1D312A;
 
 /// The ROM's write block size.
 const int _blockSize = 0x400;
@@ -228,8 +272,50 @@ class EspFlasher {
     return (await _command(_opReadReg, d)).value;
   }
 
-  /// Resets into the bootloader, syncs and checks the chip. Returns the chip magic.
-  Future<int> connect({FlashProgress? progress}) async {
+  Future<void> writeReg(int addr, int value) async {
+    final d = Uint8List(16);
+    final bd = ByteData.sublistView(d);
+    bd.setUint32(0, addr, Endian.little);
+    bd.setUint32(4, value, Endian.little);
+    bd.setUint32(8, 0xFFFFFFFF, Endian.little); // mask
+    bd.setUint32(12, 0, Endian.little); // delay
+    await _command(_opWriteReg, d);
+  }
+
+  /// Identifies the chip by its magic register, or by GET_SECURITY_INFO on ROMs whose
+  /// magic esptool does not list.
+  Future<EspChip> _identify() async {
+    final magic = await readReg(_chipMagicReg);
+    for (final c in knownChips) {
+      if (c.magic.contains(magic)) return c;
+    }
+    try {
+      // flags(4) flash_crypt_cnt(1) key_purposes(7) chip_id(4) api_version(4), then the status
+      final r = await _command(_opSecurityInfo, Uint8List(0), statusAt: 20);
+      if (r.data.length >= 22) {
+        final id = ByteData.sublistView(r.data).getUint32(12, Endian.little);
+        for (final c in knownChips) {
+          if (c.chipId == id) return c;
+        }
+      }
+    } on FlashError {
+      // old ROM without the command
+    }
+    throw FlashError('Not an ESP32-C3 or ESP32-S3 (chip magic 0x${magic.toRadixString(16)})');
+  }
+
+  Future<void> _disableWatchdogs(EspChip chip) async {
+    if (chip != esp32s3 || (await readReg(_s3UartDevBufNo)) & 0xFF != _s3UartUsbJtagSerial) return;
+    await writeReg(_s3RtcWdtProtect, _rtcWdtKey);
+    await writeReg(_s3RtcWdtConfig0, 0);
+    await writeReg(_s3RtcWdtProtect, 0);
+    await writeReg(_s3RtcSwdProtect, _rtcSwdKey);
+    await writeReg(_s3RtcSwdConf, (await readReg(_s3RtcSwdConf)) | (1 << 31)); // auto feed
+    await writeReg(_s3RtcSwdProtect, 0);
+  }
+
+  /// Resets into the bootloader, syncs and identifies the chip.
+  Future<EspChip> connect({FlashProgress? progress}) async {
     progress?.call('Resetting into the bootloader', 0);
     // 0: the board may already wait in download mode (BOOT held while plugging in or resetting);
     // a reset now could take it out again, so try without one first.
@@ -243,24 +329,22 @@ class EspFlasher {
         await _sleep(300);
       }
       if (await sync(attempts: attempt == 0 ? 2 : 7)) {
-        final magic = await readReg(_chipMagicReg);
-        if (!esp32c3Magic.contains(magic)) {
-          throw FlashError('Not an ESP32-C3 (chip magic 0x${magic.toRadixString(16)})');
-        }
-        return magic;
+        final chip = await _identify();
+        await _disableWatchdogs(chip);
+        return chip;
       }
     }
-    throw FlashError('The ESP32-C3 ROM loader does not answer. Put the board in download mode by hand: '
+    throw FlashError('The ESP32 ROM loader does not answer. Put the board in download mode by hand: '
         'hold BOOT, tap RESET (or unplug and plug in again while holding BOOT), release BOOT, then '
         'click Install firmware again.');
   }
 
-  Future<void> _attachAndParams() async {
+  Future<void> _attachAndParams(int flashSize) async {
     await _command(_opSpiAttach, Uint8List(8));
     final p = Uint8List(24);
     final bd = ByteData.sublistView(p);
     bd.setUint32(0, 0, Endian.little); // flash id
-    bd.setUint32(4, 4 * 1024 * 1024, Endian.little); // total size
+    bd.setUint32(4, flashSize, Endian.little); // total size
     bd.setUint32(8, 64 * 1024, Endian.little); // block
     bd.setUint32(12, 4 * 1024, Endian.little); // sector
     bd.setUint32(16, 256, Endian.little); // page
@@ -306,11 +390,18 @@ class EspFlasher {
     }
   }
 
-  /// Writes all images, verifies their MD5 and resets into the new firmware.
-  Future<void> flash(List<FlashImage> images, {FlashProgress? progress}) async {
-    await connect(progress: progress);
+  /// Writes the images of the target that matches the chip, verifies their MD5 and resets
+  /// into the new firmware. Returns the target that was written.
+  Future<FlashTarget> flash(List<FlashTarget> targets, {FlashProgress? progress}) async {
+    final chip = await connect(progress: progress);
+    final target = targets.where((t) => t.chip == chip.id).firstOrNull;
+    if (target == null) {
+      await hardReset();
+      throw FlashError('No bundled firmware for the ${chip.name}');
+    }
+    final images = target.images;
     progress?.call('Attaching flash', 0);
-    await _attachAndParams();
+    await _attachAndParams(target.flashSize);
     final total = images.fold<int>(0, (a, i) => a + i.data.length);
     var done = 0;
     for (final img in images) {
@@ -334,16 +425,18 @@ class EspFlasher {
     }
     progress?.call('Restarting the board', 1);
     await hardReset();
+    return target;
   }
 
-  /// Erases nothing; reports whether a ROM loader answers (used to recognise a bare ESP32-C3).
-  Future<bool> probeRom() async {
+  /// Erases nothing; returns the chip whose ROM loader answers, or null (used to recognise a
+  /// board without the DATV firmware).
+  Future<EspChip?> probeRom() async {
     try {
-      await connect();
+      final chip = await connect();
       await hardReset();
-      return true;
+      return chip;
     } on FlashError {
-      return false;
+      return null;
     }
   }
 }

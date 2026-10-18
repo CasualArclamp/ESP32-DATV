@@ -12,9 +12,10 @@ import 'package:test/test.dart';
 /// state only when DTR is written), and like WindowsSerialTransport the host writes DTR again
 /// after every RTS change.
 class SimChip implements ByteTransport {
-  SimChip({this.windows = false, this.inRom = false});
+  SimChip({this.windows = false, this.inRom = false, this.magic = 0x6921506F});
 
   final bool windows;
+  final int magic;
   bool inRom;
   bool _dtr = false, _rts = false; // host side
   bool _seenDtr = false, _seenRts = false; // device side
@@ -67,7 +68,7 @@ class SimChip implements ByteTransport {
       resp[1] = op;
       resp[2] = 4;
       if (op == 0x0A) {
-        ByteData.sublistView(resp).setUint32(4, esp32c3Magic.first, Endian.little);
+        ByteData.sublistView(resp).setUint32(4, magic, Endian.little);
       }
       _out.addAll(slipEncode(resp));
     }
@@ -91,8 +92,7 @@ void main() {
   for (final windows in [false, true]) {
     test('reset into the ROM loader works (${windows ? 'Windows' : 'Linux'} line semantics)', () async {
       final chip = SimChip(windows: windows);
-      final magic = await EspFlasher(chip).connect();
-      expect(esp32c3Magic, contains(magic));
+      expect(await EspFlasher(chip).connect(), esp32c3);
       expect(chip.inRom, isTrue);
     });
   }
@@ -104,6 +104,20 @@ void main() {
     await chip.setSignals(dtr: false, rts: true);
     await chip.setSignals(dtr: false, rts: false);
     expect(chip.inRom, isFalse);
+  });
+
+  test('an ESP32-S3 (T-Deck) is recognised', () async {
+    expect(await EspFlasher(SimChip(magic: 0x9)).connect(), esp32s3);
+  });
+
+  test('an unknown chip is refused', () async {
+    expect(EspFlasher(SimChip(inRom: true, magic: 0x12345678)).connect(), throwsA(isA<FlashError>()));
+  });
+
+  test('parseFlashSize', () {
+    expect(parseFlashSize('16MB'), 16 * 1024 * 1024);
+    expect(parseFlashSize('4MB'), 4 * 1024 * 1024);
+    expect(parseFlashSize(null), 4 * 1024 * 1024);
   });
 
   test('a board already in download mode is not reset', () async {

@@ -17,11 +17,18 @@ class EspError implements Exception {
   String toString() => message;
 }
 
-/// Firmware identification from the INFO reply ("ESP32DATV 1").
+/// Firmware identification from the INFO reply ("ESP32DATV 1", or "TDECKDATV 0 board tdeck"
+/// from the standalone T-Deck firmware).
 class FirmwareInfo {
-  const FirmwareInfo(this.version, this.line);
+  const FirmwareInfo(this.version, this.line, {this.tdeck = false, this.board});
   final int version;
   final String line;
+
+  /// The standalone T-Deck firmware: it does not take the app's TX/RX commands.
+  final bool tdeck;
+
+  /// T-Deck firmware board setting ("tdeck", or "none" before it is set).
+  final String? board;
 }
 
 /// Parsed "OK QPSKT LO ... BAUD ... OUT ..." line.
@@ -82,14 +89,15 @@ class EspLink {
       final sw = Stopwatch()..start();
       while (sw.elapsedMilliseconds < 700) {
         await poll(timeout: const Duration(milliseconds: 20));
-        final m = RegExp(r'ESP32DATV\s+(\d+)').firstMatch(text);
+        final m = RegExp(r'(ESP32DATV|TDECKDATV)\s+(\d+)').firstMatch(text);
         if (m != null) {
           await _sleep(100);
           await t.flushInput();
           _buf.clear();
-          final line = text.split(RegExp(r'[\r\n]+')).firstWhere((l) => l.contains('ESP32DATV'), orElse: () => m[0]!);
+          final line = text.split(RegExp(r'[\r\n]+')).firstWhere((l) => l.contains(m[1]!), orElse: () => m[0]!).trim();
           _text.clear();
-          return FirmwareInfo(int.parse(m[1]!), line.trim());
+          return FirmwareInfo(int.parse(m[2]!), line,
+              tdeck: m[1] == 'TDECKDATV', board: RegExp(r'board\s+(\S+)').firstMatch(line)?[1]);
         }
       }
     }

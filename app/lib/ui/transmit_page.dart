@@ -103,7 +103,9 @@ class TransmitPage extends StatelessWidget {
           FilledButton.icon(onPressed: c.stop, icon: const Icon(Icons.stop), label: const Text('Stop')),
         const SizedBox(width: 12),
         Expanded(
-          child: Text(c.board != BoardState.datv
+          child: Text(c.board == BoardState.tdeck
+              ? 'The T-Deck transmits on its own screen. The app needs an ESP32-C3 with the DATV firmware.'
+              : c.board != BoardState.datv
               ? 'Connect a board with the DATV firmware first (Device page).'
               : c.planError ?? '${c.config.freqMhz.toStringAsFixed(3)} MHz, ${c.plan!.label}'),
         ),

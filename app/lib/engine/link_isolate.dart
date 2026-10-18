@@ -131,28 +131,32 @@ class _LinkServer {
     final t = await _open();
     final info = await EspLink(t).hello(tries: probeRom ? 2 : 6);
     if (info != null) {
-      _ev({'ev': 'hello', 'id': id, 'version': info.version, 'line': info.line});
+      _ev({'ev': 'hello', 'id': id, 'version': info.version, 'line': info.line, 'tdeck': info.tdeck});
       return;
     }
     if (!probeRom) {
-      _ev({'ev': 'hello', 'id': id, 'version': null, 'rom': null});
+      _ev({'ev': 'hello', 'id': id, 'version': null});
       return;
     }
-    // no DATV firmware: is it an ESP32-C3 in ROM-loader reach?
-    final rom = await EspFlasher(t).probeRom();
+    // no DATV firmware: is it an ESP32-C3/S3 in ROM-loader reach?
+    final chip = await EspFlasher(t).probeRom();
     await _closeTransport(); // the reset re-enumerates on some hosts
-    _ev({'ev': 'hello', 'id': id, 'version': null, 'rom': rom});
+    _ev({'ev': 'hello', 'id': id, 'version': null, 'chip': chip?.name});
   }
 
   Future<void> _flash(Object? id, Map<String, Object?> m) async {
     final t = await _open();
-    final imgs = [
-      for (final i in (m['images'] as List).cast<Map>())
-        FlashImage(i['name'] as String, i['offset'] as int, (i['data'] as TransferableTypedData).materialize().asUint8List(),
-            md5: i['md5'] as String?),
+    final targets = [
+      for (final tg in (m['targets'] as List).cast<Map>())
+        FlashTarget(tg['chip'] as String, tg['flashSize'] as int, [
+          for (final i in (tg['images'] as List).cast<Map>())
+            FlashImage(i['name'] as String, i['offset'] as int,
+                (i['data'] as TransferableTypedData).materialize().asUint8List(),
+                md5: i['md5'] as String?),
+        ]),
     ];
     var lastPct = -1;
-    await EspFlasher(t).flash(imgs, progress: (stage, f) {
+    await EspFlasher(t).flash(targets, progress: (stage, f) {
       final pct = (f * 100).floor();
       if (pct != lastPct) {
         lastPct = pct;
@@ -161,9 +165,23 @@ class _LinkServer {
     });
     await _closeTransport();
     await Future<void>.delayed(const Duration(milliseconds: 500));
-    final t2 = await _open();
-    final info = await EspLink(t2).hello(tries: 8);
-    _ev({'ev': 'flashed', 'id': id, 'version': info?.version, 'line': info?.line});
+    var info = await EspLink(await _open()).hello(tries: 8);
+    if (info != null && info.tdeck && info.board == 'none') {
+      // the T-Deck image was written over an empty NVS: the screen stays dark until the
+      // board is set, and setting it reboots
+      _ev({'ev': 'flashProgress', 'id': id, 'stage': 'Setting the board to T-Deck', 'f': 1.0});
+      try {
+        await EspLink(await _open()).query('BOARD tdeck');
+      } on EspError {
+        // the reboot can drop the port before the answer arrives
+      } on TransportError {
+        // same
+      }
+      await _closeTransport();
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
+      info = await EspLink(await _open()).hello(tries: 8);
+    }
+    _ev({'ev': 'flashed', 'id': id, 'version': info?.version, 'line': info?.line, 'tdeck': info?.tdeck});
   }
 
   // ---------------------------------------------------------------- media in
@@ -264,6 +282,7 @@ class _LinkServer {
     final link = EspLink(t);
     final info = await link.hello(tries: 6, bootWaitMs: 200);
     if (info == null) throw EspError('The board does not answer INFO: install the DATV firmware first');
+    if (info.tdeck) throw EspError('The T-Deck firmware receives on its own screen, not through the app');
     if (info.version < 2) throw EspError('Receiving needs DATV firmware version 2 or later: install the bundled firmware');
     final rxInfo = await link.query('RXINFO');
     final gm = RegExp(r'gainmax (\d+)').firstMatch(rxInfo);
@@ -381,6 +400,7 @@ class _LinkServer {
     final link = EspLink(t);
     final info = await link.hello(tries: 6, bootWaitMs: 200);
     if (info == null) throw EspError('The board does not answer INFO: flash the DATV firmware first');
+    if (info.tdeck) throw EspError('The T-Deck firmware transmits from its own screen, not through the app');
     final st = await link.start(plan.command);
     _ev({
       'ev': 'txStarted',

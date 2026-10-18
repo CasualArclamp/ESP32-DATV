@@ -96,7 +96,9 @@ class ReceivePage extends StatelessWidget {
             FilledButton.icon(onPressed: c.stopRx, icon: const Icon(Icons.stop), label: const Text('Stop')),
           const SizedBox(width: 12),
           Expanded(
-            child: Text(c.board != BoardState.datv
+            child: Text(c.board == BoardState.tdeck
+                ? 'The T-Deck receives on its own screen. The app needs an ESP32-C3 with the DATV firmware.'
+                : c.board != BoardState.datv
                 ? 'Connect a board with the DATV firmware first (Device page).'
                 : c.transmitting
                     ? 'The board is transmitting.'

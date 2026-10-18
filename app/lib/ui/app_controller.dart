@@ -14,22 +14,28 @@ import '../platform/capture/capture_registry.dart' as cap;
 import '../platform/capture/media_source.dart';
 import '../platform/serial/ports.dart';
 
-enum BoardState { disconnected, connecting, datv, noAnswer, bareC3, unknown, flashing }
+enum BoardState { disconnected, connecting, datv, tdeck, noAnswer, bareChip, unknown, flashing }
 
-/// Bundled firmware (assets/firmware/manifest.json).
+/// Bundled firmware: assets/firmware/ (ESP32-C3) and assets/firmware/tdeck/ (T-Deck, ESP32-S3),
+/// each with a manifest.json.
 class FirmwareBundle {
   FirmwareBundle(this.manifest, this.images);
   final Map<String, dynamic> manifest;
   final List<FlashImage> images;
 
-  int get version => manifest['version'] as int? ?? 0;
-  String get describe => 'v$version (${manifest['source_commit'] ?? '?'}, ESP-IDF ${manifest['idf'] ?? '?'})';
+  static const dirs = ['assets/firmware', 'assets/firmware/tdeck'];
 
-  static Future<FirmwareBundle> load() async {
-    final m = jsonDecode(await rootBundle.loadString('assets/firmware/manifest.json')) as Map<String, dynamic>;
+  int get version => manifest['version'] as int? ?? 0;
+  String get chip => manifest['chip'] as String? ?? 'esp32c3';
+  String get label => chip == 'esp32s3' ? 'T-Deck (ESP32-S3)' : 'ESP32-C3';
+  String get describe => '$label v$version (${manifest['source_commit'] ?? '?'}, ESP-IDF ${manifest['idf'] ?? '?'})';
+  FlashTarget get target => FlashTarget(chip, parseFlashSize(manifest['flash_size'] as String?), images);
+
+  static Future<FirmwareBundle> load(String dir) async {
+    final m = jsonDecode(await rootBundle.loadString('$dir/manifest.json')) as Map<String, dynamic>;
     final images = <FlashImage>[];
     for (final i in (m['images'] as List).cast<Map<String, dynamic>>()) {
-      final data = await rootBundle.load('assets/firmware/${i['file']}');
+      final data = await rootBundle.load('$dir/${i['file']}');
       images.add(FlashImage(i['file'] as String, i['offset'] as int, data.buffer.asUint8List(), md5: i['md5'] as String?));
     }
     return FirmwareBundle(m, images);
@@ -59,7 +65,7 @@ class AppController extends ChangeNotifier {
   bool messageIsError = true;
   double? flashProgress;
   String? flashStage;
-  FirmwareBundle? firmware;
+  List<FirmwareBundle> firmware = [];
 
   List<CaptureDevice> cameras = [], screens = [], mics = [];
   CaptureDevice? camera, screen, mic;
@@ -137,11 +143,13 @@ class AppController extends ChangeNotifier {
     } catch (_) {
       // corrupt preferences: keep defaults
     }
-    try {
-      firmware = await FirmwareBundle.load();
-    } catch (e) {
-      message = 'Bundled firmware missing: $e';
-      messageIsError = true;
+    for (final dir in FirmwareBundle.dirs) {
+      try {
+        firmware.add(await FirmwareBundle.load(dir));
+      } catch (e) {
+        message = 'Bundled firmware missing: $e';
+        messageIsError = true;
+      }
     }
     await refreshPorts();
     unawaited(refreshCaptureDevices());
@@ -253,7 +261,7 @@ class AppController extends ChangeNotifier {
       });
       final h = await s.hello();
       if (h.version != null) {
-        board = BoardState.datv;
+        board = h.tdeck ? BoardState.tdeck : BoardState.datv;
         boardLine = h.line;
       } else {
         board = BoardState.noAnswer;
@@ -269,7 +277,7 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Resets a board that does not answer into the ROM loader to see whether it is an ESP32-C3.
+  /// Resets a board that does not answer into the ROM loader to see which chip it is.
   Future<void> identifyChip() async {
     final s = session;
     if (s == null) return;
@@ -277,8 +285,10 @@ class AppController extends ChangeNotifier {
     notifyListeners();
     try {
       final h = await s.hello(probeRom: true);
-      board = h.version != null ? BoardState.datv : (h.rom == true ? BoardState.bareC3 : BoardState.unknown);
-      boardLine = h.line;
+      board = h.version != null
+          ? (h.tdeck ? BoardState.tdeck : BoardState.datv)
+          : (h.chip != null ? BoardState.bareChip : BoardState.unknown);
+      boardLine = h.line ?? h.chip;
     } catch (e) {
       board = BoardState.unknown;
       message = 'Identification failed: $e';
@@ -303,19 +313,19 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> flash() async {
-    final s = session, fw = firmware;
-    if (s == null || fw == null) return;
+    final s = session;
+    if (s == null || firmware.isEmpty) return;
     board = BoardState.flashing;
     flashProgress = 0;
     message = null;
     notifyListeners();
     try {
-      final h = await s.flash(fw.images, progress: (stage, f) {
+      final h = await s.flash([for (final b in firmware) b.target], progress: (stage, f) {
         flashStage = stage;
         flashProgress = f;
         notifyListeners();
       });
-      board = h.version != null ? BoardState.datv : BoardState.unknown;
+      board = h.version == null ? BoardState.unknown : (h.tdeck ? BoardState.tdeck : BoardState.datv);
       boardLine = h.line;
       message = h.version != null ? 'Firmware installed and verified.' : 'Flashed, but the board does not answer yet. Reconnect.';
       messageIsError = h.version == null;
