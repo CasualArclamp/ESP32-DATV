@@ -15,6 +15,9 @@ WORK=${1:?work directory}
 OUT=${2:?output directory}
 FFMPEG_BRANCH=${FFMPEG_BRANCH:-release/8.1}
 JOBS=${JOBS:-$(nproc)}
+# a login shell of MSYS2 does not see Git for Windows
+command -v git >/dev/null || PATH="$PATH:/c/Program Files/Git/cmd"
+command -v git >/dev/null || { echo "git not found: pacman -S git, or install Git for Windows"; exit 1; }
 mkdir -p "$WORK" "$OUT"
 cd "$WORK"
 PREFIX=$PWD/prefix
@@ -32,8 +35,9 @@ echo "== vvenc (H.266 encoder; MSYS2 has no package)"
 clone https://github.com/fraunhoferhhi/vvenc.git vvenc
 if [ ! -f "$PREFIX/lib/pkgconfig/libvvenc.pc" ]; then
     cmake -S vvenc -B vvenc/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-        -DBUILD_SHARED_LIBS=OFF -DVVENC_ENABLE_LINK_TIME_OPT=OFF -DVVENC_LIBRARY_ONLY=ON >/dev/null
-    cmake --build vvenc/build -j "$JOBS" >/dev/null
+        -DBUILD_SHARED_LIBS=OFF -DVVENC_ENABLE_LINK_TIME_OPT=OFF -DVVENC_LIBRARY_ONLY=ON \
+        -DVVENC_ENABLE_WERROR=OFF >/dev/null # newer GCCs warn about more than vvenc was written for
+    cmake --build vvenc/build -j "$JOBS" | tail -3
     cmake --install vvenc/build >/dev/null
 fi
 
@@ -43,7 +47,7 @@ cd ffmpeg
 ./configure --prefix="$PREFIX" --arch=x86_64 --target-os=mingw32 \
     --enable-gpl --enable-version3 --enable-nonfree \
     --enable-libfdk-aac --enable-libx264 --enable-libx265 --enable-libsvtav1 --enable-libvvenc \
-    --enable-libopus --enable-libmp3lame --enable-libdav1d --enable-nvenc \
+    --enable-libopus --enable-libmp3lame --enable-libdav1d --enable-ffnvcodec --enable-nvenc \
     --disable-doc --disable-debug --disable-ffplay --disable-autodetect \
     --enable-schannel --enable-d3d11va --enable-dxva2 \
     --extra-libs="-lstdc++ -lpthread" --pkg-config-flags=--static

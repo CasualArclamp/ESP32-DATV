@@ -13,6 +13,23 @@ pub fn example_cal() -> ([f64; 2], f64, f64) {
     ([f(&v["dc"][0], 0.0), f(&v["dc"][1], 0.0)], f(&v["iq_gain"], 1.0), f(&v["iq_phase_deg"], 0.0))
 }
 
+/// An FFmpeg in the folder `ffmpeg` beside this program (the one scripts/build-ffmpeg-fdk.sh
+/// makes, with libfdk_aac for HE-AAC) is used rather than the one on PATH.
+fn beside_program() -> Option<String> {
+    let p = std::env::current_exe().ok()?.parent()?.join("ffmpeg").join("ffmpeg.exe");
+    p.is_file().then(|| p.display().to_string())
+}
+
+/// "ffmpeg" (whatever PATH has) gives way to the one beside the program; a path the user
+/// set stays.
+fn prefer_own_ffmpeg(c: &mut TxConfig) {
+    if c.media.ffmpeg == "ffmpeg" {
+        if let Some(p) = beside_program() {
+            c.media.ffmpeg = p;
+        }
+    }
+}
+
 pub fn default_config() -> TxConfig {
     let mut c = TxConfig {
         rf: RfConfig::default(),
@@ -24,6 +41,7 @@ pub fn default_config() -> TxConfig {
         seconds: 0.0,
     };
     set_cal(&mut c.rf, true);
+    prefer_own_ffmpeg(&mut c);
     c
 }
 
@@ -135,6 +153,11 @@ pub fn from_json(v: &Value) -> TxConfig {
     if let Some(x) = v["codec"].as_str().and_then(Codec::from_key) {
         c.media.codec = x;
     }
+    // a path that has gone (the folder was moved) falls back to PATH or the one beside the program
+    if c.media.ffmpeg.contains(['\\', '/']) && !std::path::Path::new(&c.media.ffmpeg).is_file() {
+        c.media.ffmpeg = "ffmpeg".into();
+    }
+    prefer_own_ffmpeg(&mut c);
     c
 }
 
@@ -308,7 +331,9 @@ mod tests {
         assert_eq!(c.media.codec, Codec::Vvc);
         assert_eq!((c.media.audio, c.media.audio_kbps, c.media.speed), (AudioCodec::Opus, 24, 3));
         assert!(!has_cal(&c.rf));
-        let back = from_json(&to_json(&c));
+        c.media.ffmpeg = "ffmpeg".into(); // the test must not depend on what is beside the test program
+        let mut back = from_json(&to_json(&c));
+        back.media.ffmpeg = "ffmpeg".into();
         assert!(back == c);
         assert!(apply_args(&mut c, &a("--codec mpeg2")).is_err());
     }
