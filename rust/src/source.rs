@@ -324,6 +324,9 @@ pub struct MediaConfig {
     pub vbv_s: f32,
     /// Packets kept ready between FFmpeg and the DVB coder, in seconds; 0 = half a second.
     pub buffer_s: f32,
+    /// Lower the video bit rate while transmitting when the encoder makes more than the
+    /// multiplex holds.
+    pub watchdog: bool,
     /// Seconds between key frames; 0 = from the bit rate (auto_gop_seconds).
     pub gop_s: f32,
     pub bframes: bool,
@@ -351,6 +354,7 @@ impl Default for MediaConfig {
             video_kbps: 0,
             camera: String::new(),
             pre_encode: false,
+            watchdog: true,
             vbv_s: 0.0,
             buffer_s: 0.0,
             gop_s: 0.0,
@@ -537,7 +541,11 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     let vb = if m.video_kbps > 0 {
         m.video_kbps as i64 * 1000
     } else {
-        ((mux as i64 - aud_bps as i64 - psi) as f64 * 0.88) as i64
+        // Every picture is its own PES packet: a header and on average half a transport
+        // packet of stuffing, about 110 bytes, whatever the bit rate. On a narrow channel
+        // that is a good part of it (tx_dvbs.py allows a flat 12 %, too little below 100 kb/s).
+        let packing = fps as i64 * 900;
+        ((mux as i64 - aud_bps as i64 * 103 / 100 - psi - packing) as f64 * 0.95) as i64
     };
     if vb < 6000 {
         return Err(format!(
@@ -674,6 +682,8 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     a.push(format!("{:.2}", (vbv_s + 0.2).max(0.7)));
     a.extend(["-pcr_period", if aud > 50 { "40" } else { "100" }, "-pat_period"].map(s));
     a.push(pat.to_string());
+    // without this FFmpeg hands over its output 32 kB at a time: seconds of a narrow channel in one lump
+    a.extend(["-flush_packets", "1"].map(s));
     a.extend(["-mpegts_flags", "+resend_headers", "-metadata"].map(s));
     a.push(format!("service_provider={}", m.provider));
     a.push(s("-metadata"));
@@ -700,6 +710,23 @@ impl Log {
     }
 }
 
+/// What the source has delivered: all packets, and the null packets among them. FFmpeg
+/// fills its constant rate multiplex with null packets; when it sends none, picture and
+/// sound take all of it and the stream starts to run late.
+#[derive(Default)]
+pub struct Flow {
+    pub packets: AtomicU64,
+    pub nulls: AtomicU64,
+}
+
+/// The counters of a source that a replacement source carries on.
+#[derive(Clone)]
+pub struct Shared {
+    pub stats: Arc<Mutex<EncStats>>,
+    pub queued: Arc<AtomicUsize>,
+    pub flow: Arc<Flow>,
+}
+
 /// Delivers 188-byte packets; `take` pads with null packets when the source runs dry.
 pub struct TsSource {
     rx: Option<Receiver<Packet>>,
@@ -715,6 +742,7 @@ pub struct TsSource {
     /// Packets waiting between the source and the DVB coder, and how many fit.
     pub queued: Arc<AtomicUsize>,
     pub queue_cap: usize,
+    pub flow: Arc<Flow>,
 }
 
 /// Aligns a byte stream on the 0x47 sync bytes and sends whole packets.
@@ -725,6 +753,7 @@ struct Framer {
     stop: Arc<AtomicBool>,
     out: Vec<Packet>,
     queued: Arc<AtomicUsize>,
+    flow: Arc<Flow>,
 }
 
 impl Framer {
@@ -748,6 +777,10 @@ impl Framer {
                 loop {
                     match self.tx.try_send(q) {
                         Ok(()) => {
+                            self.flow.packets.fetch_add(1, Ordering::Relaxed);
+                            if q[1] & 0x1F == 0x1F && q[2] == 0xFF {
+                                self.flow.nulls.fetch_add(1, Ordering::Relaxed);
+                            }
                             self.queued.fetch_add(1, Ordering::Relaxed);
                             break;
                         }
@@ -782,6 +815,7 @@ impl TsSource {
             stats: Default::default(),
             queued: Default::default(),
             queue_cap: 0,
+            flow: Default::default(),
         }
     }
 
@@ -810,8 +844,15 @@ impl TsSource {
         s.rx = Some(rx);
         s.queue_cap = queue;
         let fix = av1.then(Av1Fix::new);
-        let mut fr =
-            Framer { buf: Vec::new(), tx, fix, stop: s.stop.clone(), out: Vec::new(), queued: s.queued.clone() };
+        let mut fr = Framer {
+            buf: Vec::new(),
+            tx,
+            fix,
+            stop: s.stop.clone(),
+            out: Vec::new(),
+            queued: s.queued.clone(),
+            flow: s.flow.clone(),
+        };
         let (log, path) = (log.clone(), path.to_string());
         std::thread::spawn(move || {
             use std::io::Seek;
@@ -839,8 +880,31 @@ impl TsSource {
         Ok(s)
     }
 
-    /// FFmpeg encoding the configured source. `queue`: packets kept ready.
-    pub fn ffmpeg(m: &MediaConfig, plan: &EncodePlan, log: &Log, queue: usize) -> Result<Self, String> {
+    /// The counters, for a source that will take this one's place.
+    pub fn shared(&self) -> Shared {
+        Shared { stats: self.stats.clone(), queued: self.queued.clone(), flow: self.flow.clone() }
+    }
+
+    /// Puts another source in this one's place (the encoder started again with other
+    /// settings): its packets from now on, the same counters, copy and preview. The old
+    /// FFmpeg ends.
+    pub fn replace(&mut self, mut new: TsSource) {
+        std::mem::swap(&mut self.rx, &mut new.rx);
+        std::mem::swap(&mut self.child, &mut new.child);
+        std::mem::swap(&mut self.stop, &mut new.stop);
+        self.queue_cap = new.queue_cap;
+        drop(new); // holds the old FFmpeg now
+    }
+
+    /// FFmpeg encoding the configured source. `queue`: packets kept ready. `carry`: the
+    /// counters of the source this one replaces.
+    pub fn ffmpeg(
+        m: &MediaConfig,
+        plan: &EncodePlan,
+        log: &Log,
+        queue: usize,
+        carry: Option<Shared>,
+    ) -> Result<Self, String> {
         let mut child = hidden(Command::new(&m.ffmpeg).args(&plan.args))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -853,9 +917,21 @@ impl TsSource {
         let (tx, rx) = sync_channel(queue);
         s.rx = Some(rx);
         s.queue_cap = queue;
+        if let Some(c) = carry {
+            c.queued.store(0, Ordering::Relaxed); // what the old source had waiting is dropped
+            *c.stats.lock().unwrap() = EncStats::default();
+            (s.stats, s.queued, s.flow) = (c.stats, c.queued, c.flow);
+        }
         let fix = (m.codec == Codec::Av1).then(Av1Fix::new);
-        let mut fr =
-            Framer { buf: Vec::new(), tx, fix, stop: s.stop.clone(), out: Vec::new(), queued: s.queued.clone() };
+        let mut fr = Framer {
+            buf: Vec::new(),
+            tx,
+            fix,
+            stop: s.stop.clone(),
+            out: Vec::new(),
+            queued: s.queued.clone(),
+            flow: s.flow.clone(),
+        };
         let l = log.clone();
         let stats = s.stats.clone();
         std::thread::spawn(move || {
@@ -890,6 +966,16 @@ impl TsSource {
         });
         s.child = Some(child);
         Ok(s)
+    }
+
+    /// Packets waiting to be taken. A source without packets of its own (null packets,
+    /// carrier) always has enough.
+    pub fn ready(&self) -> usize {
+        if self.rx.is_some() {
+            self.queued.load(Ordering::Relaxed)
+        } else {
+            usize::MAX
+        }
     }
 
     /// n packets, null packets where the source has none ready.

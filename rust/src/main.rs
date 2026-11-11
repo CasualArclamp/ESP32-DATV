@@ -422,6 +422,11 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut m.service_name).desired_width(220.0));
                 ui.end_row();
             });
+            ui.checkbox(&mut m.watchdog, "Watchdog").on_hover_text(
+                "Watches the room left in the channel while transmitting. If the encoder makes more than \
+                 the channel carries for 4 seconds, it is started again with 15 % less video bit rate \
+                 (a short break in the picture), as often as it takes.",
+            );
             ui.collapsing("Buffers", |ui| {
                 egui::Grid::new("buffers").num_columns(2).show(ui, |ui| {
                     ui.label("Rate buffer");
@@ -633,8 +638,10 @@ impl App {
                             note.to_string(),
                         );
                     }
-                    let (colour, note) = if st.underruns > 0 {
-                        (red, format!("{} underruns: USB or the PC is too slow", st.underruns))
+                    let (colour, note) = if st.underruns_rising && st.seconds > 3.0 {
+                        (red, format!("running dry ({} underruns): USB or the PC is too slow", st.underruns))
+                    } else if st.underruns > 0 {
+                        (green, format!("steady ({} underruns earlier, none now)", st.underruns))
                     } else {
                         (green, "no underruns".to_string())
                     };
@@ -647,16 +654,26 @@ impl App {
                         note,
                     );
                     let (colour, note) = if !st.live_encode {
-                        (green, "null packets in the last second")
+                        (green, "null packets on air in the last second")
                     } else if st.padding > 60.0 && st.seconds > 8.0 {
-                        (red, "mostly null packets: the encoder is behind or has stopped")
-                    } else if st.padding < 0.5 && st.seconds > 8.0 {
-                        (amber, "no room left: the stream is running late")
+                        (red, "nearly all null packets: the encoder is behind or has stopped")
+                    } else if st.late && st.seconds > 8.0 {
+                        (red, "none: the encoder makes more than the channel carries, the stream runs late")
                     } else {
-                        (green, "null packets in the last second")
+                        (green, "null packets on air in the last second")
                     };
-                    bar(ui, "Padding", st.padding / 100.0, colour, format!("{:.0} %", st.padding), note.to_string());
+                    bar(ui, "Room left", st.padding / 100.0, colour, format!("{:.0} %", st.padding), note.to_string());
                 });
+                if st.lowered % 1000 > 0 {
+                    ui.colored_label(
+                        amber,
+                        format!(
+                            "Watchdog lowered the video bit rate {} time(s): now {} kb/s",
+                            st.lowered % 1000,
+                            st.video_kbps
+                        ),
+                    );
+                }
                 ui.weak(format!("Transport stream: {} packets from the source, {} null", st.pkts, st.nulls));
             }
             if !st.error.is_empty() {

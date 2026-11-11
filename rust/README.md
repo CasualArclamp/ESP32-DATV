@@ -47,12 +47,20 @@ capacity as in `tx_dvbs.py`, or set them yourself:
   32 kb/s and are made for several times that, so the window does not offer them on a
   channel under 200 kb/s: use Opus or AAC there. HE-AAC and HE-AAC v2 need an FFmpeg built
   with libfdk_aac (the usual Windows builds do not have it; FFmpeg's own AAC encoder makes
-  AAC-LC only).
+  AAC-LC only). `scripts/build-ffmpeg-fdk.sh` builds one in MSYS2 from the FFmpeg sources;
+  such a build is "non-free": for your own use, not to be passed on. Put its folder under
+  Video > FFmpeg > Program.
 - **Encode the whole file first** (video file source): the file is encoded to a transport
   stream before anything is transmitted, then sent in a loop. The encoder need not keep up
   with real time, so the slow speeds and H.266 work at any picture size. The same file with
   the same settings is encoded only once (kept in `%TEMP%\datv-tx-cache`). At the point
   where the file starts again the receiver sees a jump in the clock and may glitch.
+- **Watchdog** (on by default): some encoders cannot squeeze a picture as far as asked,
+  NVENC with a large picture at a low bit rate for one, and make more than the channel
+  carries. FFmpeg's multiplex then has no null packets left, its packets pile up and the
+  stream runs later and later. When the watchdog sees both for 6 seconds it starts the
+  encoder again with 15 % less video bit rate, as often as it takes; the picture breaks for
+  a second or two each time and the stream's clock starts anew.
 - **Buffers**: the encoder's rate buffer (VBV, default 0.5 s; larger evens out quality
   across busy and quiet scenes and adds delay) and the source buffer (encoded packets kept
   ready, default 0.5 s; smaller is less delay, larger rides out hiccups).
@@ -66,7 +74,7 @@ While it runs, four bars show how it is doing:
 | Encoder | encoding speed against real time, from FFmpeg's progress reports: green keeps up, amber is a little slow, red is too slow and the picture will stutter |
 | Source buffer | encoded packets waiting for the transmitter, in milliseconds |
 | ESP buffer | symbols in the board's buffer; red if it has run dry (USB or the PC too slow) |
-| Padding | null packets in the last second: near 100 % means the encoder delivers nothing, 0 % means the stream is running late |
+| Room left | null packets on air in the last second, FFmpeg's and the ones added here: near 100 % means the encoder delivers nothing; red when there are none and packets pile up (the watchdog's cue) |
 
 **Dry run** runs everything into a simulated ESP: no board is opened and nothing is
 transmitted. `datv-tx-cli` is the same engine on the command line:

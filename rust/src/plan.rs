@@ -170,6 +170,10 @@ pub struct Plan {
     pub if_hz: i64,
     /// Symbol bytes the ESP consumes per second
     pub bytes_per_sec: f64,
+    /// DVB-S2: symbol bytes of one PLFRAME and the transport stream packets it carries
+    /// (DVB-S has no frames to fill: 0).
+    pub frame_bytes: usize,
+    pub frame_packets: usize,
     pub notes: Vec<String>,
 }
 
@@ -233,7 +237,15 @@ pub fn plan(c: &RfConfig) -> Result<Plan, String> {
         "8psk" if sps == 8 => 0.375,
         _ => 0.5,
     };
+    let (frame_bytes, frame_packets) = if c.dvbs2 {
+        let fi = dvbs2::frame_info(&c.fec, &c.frame, c.pilots, m)?;
+        ((fi.plframe as f64 * bytes_per_symbol).ceil() as usize, fi.dfl.div_ceil(1504))
+    } else {
+        (0, 0)
+    };
     Ok(Plan {
+        frame_bytes,
+        frame_packets,
         sps,
         baud_act,
         capacity,

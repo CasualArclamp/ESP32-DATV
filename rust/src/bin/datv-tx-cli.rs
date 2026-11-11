@@ -38,7 +38,7 @@ fn main() {
             last = st.seconds;
             if st.live_encode {
                 println!(
-                    "  encoder {:.2}x real time; source buffer {} of {} packets; padding {:.0} %",
+                    "  encoder {:.2}x real time; source buffer {} of {} packets; room left {:.0} %",
                     st.enc.speed, st.queue, st.queue_cap, st.padding
                 );
             }
