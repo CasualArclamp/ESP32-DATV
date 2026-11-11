@@ -1,7 +1,7 @@
 # DATV TX (Rust, Windows)
 
 A transmitter for the ESP32-DATV firmware with a choice of video codec: **H.264, H.265 (HEVC),
-H.266 (VVC) or AV1**, and of sound codec: **MP2, MP3, AAC, Opus, AC-3 or E-AC-3**. It is a Rust port of `host/tx_dvbs.py`: FFmpeg encodes picture and sound
+H.266 (VVC) or AV1**, and of sound codec: **MP2, MP3, AAC, HE-AAC, Opus, AC-3 or E-AC-3**. It is a Rust port of `host/tx_dvbs.py`: FFmpeg encodes picture and sound
 and makes the transport stream, this program does the DVB-S / DVB-S2 coding and feeds the
 ESP32-C3 over USB. The board needs the same firmware as the Flutter app and the Python script.
 
@@ -43,9 +43,30 @@ capacity as in `tx_dvbs.py`, or set them yourself:
   narrow channel has few bits to spare. The price is the wait for the first picture after
   the receiver locks.
 - **B frames** on or off for H.264 and H.265 (the AV1 and H.266 encoders decide themselves).
-- **Sound codec** and bit rate. AC-3 and E-AC-3 need at least 32 kb/s; Opus runs at 48 kHz.
+- **Sound codec** and bit rate. Opus runs at 48 kHz. AC-3 and E-AC-3 cannot go below
+  32 kb/s and are made for several times that, so the window does not offer them on a
+  channel under 200 kb/s: use Opus or AAC there. HE-AAC and HE-AAC v2 need an FFmpeg built
+  with libfdk_aac (the usual Windows builds do not have it; FFmpeg's own AAC encoder makes
+  AAC-LC only).
+- **Encode the whole file first** (video file source): the file is encoded to a transport
+  stream before anything is transmitted, then sent in a loop. The encoder need not keep up
+  with real time, so the slow speeds and H.266 work at any picture size. The same file with
+  the same settings is encoded only once (kept in `%TEMP%\datv-tx-cache`). At the point
+  where the file starts again the receiver sees a jump in the clock and may glitch.
+- **Buffers**: the encoder's rate buffer (VBV, default 0.5 s; larger evens out quality
+  across busy and quiet scenes and adds delay) and the source buffer (encoded packets kept
+  ready, default 0.5 s; smaller is less delay, larger rides out hiccups).
 - **Preview**: a second FFmpeg decodes a copy of the stream that goes on air and the window
   shows its picture, so you see the result of the encoding, not the source.
+
+While it runs, four bars show how it is doing:
+
+| Bar | Meaning |
+|---|---|
+| Encoder | encoding speed against real time, from FFmpeg's progress reports: green keeps up, amber is a little slow, red is too slow and the picture will stutter |
+| Source buffer | encoded packets waiting for the transmitter, in milliseconds |
+| ESP buffer | symbols in the board's buffer; red if it has run dry (USB or the PC too slow) |
+| Padding | null packets in the last second: near 100 % means the encoder delivers nothing, 0 % means the stream is running late |
 
 **Dry run** runs everything into a simulated ESP: no board is opened and nothing is
 transmitted. `datv-tx-cli` is the same engine on the command line:

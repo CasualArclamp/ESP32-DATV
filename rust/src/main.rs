@@ -286,7 +286,15 @@ impl App {
             _ => {}
         }
 
+        if m.source == SourceKind::File {
+            ui.checkbox(&mut m.pre_encode, "Encode the whole file first").on_hover_text(
+                "Encodes the file to a transport stream before anything is transmitted, then sends that in a \
+                 loop. The encoder need not keep up with real time, so the slow speeds and H.266 work at any \
+                 picture size. The same file and settings are encoded only once.",
+            );
+        }
         if m.source.encoded() {
+            let mux_bps = plan(&self.cfg.rf).map(|p| (p.capacity * 0.965) as u32).unwrap_or(u32::MAX);
             ui.add_space(8.0);
             ui.heading("Video and sound");
             let installed = self.encoders.clone().unwrap_or_default();
@@ -388,8 +396,13 @@ impl App {
                 egui::ComboBox::from_id_salt("audio").selected_text(m.audio.label()).width(220.0).show_ui(ui, |ui| {
                     for c in AudioCodec::ALL {
                         let have = c.available(&installed);
-                        let label = if have { c.label().to_string() } else { format!("{} (not in this FFmpeg)", c.label()) };
-                        ui.add_enabled_ui(have, |ui| ui.selectable_value(&mut m.audio, c, label));
+                        let poor = c.unsuited(mux_bps);
+                        let label = match (have, poor) {
+                            (false, _) => format!("{} (not in this FFmpeg)", c.label()),
+                            (true, Some(why)) => format!("{} ({why})", c.label()),
+                            _ => c.label().to_string(),
+                        };
+                        ui.add_enabled_ui(have && poor.is_none(), |ui| ui.selectable_value(&mut m.audio, c, label));
                     }
                 });
                 ui.end_row();
@@ -408,6 +421,39 @@ impl App {
                 ui.label("Service name");
                 ui.add(egui::TextEdit::singleline(&mut m.service_name).desired_width(220.0));
                 ui.end_row();
+            });
+            ui.collapsing("Buffers", |ui| {
+                egui::Grid::new("buffers").num_columns(2).show(ui, |ui| {
+                    ui.label("Rate buffer");
+                    ui.add(egui::DragValue::new(&mut m.vbv_s).range(0.0..=5.0).speed(0.05).custom_formatter(|v, _| {
+                        if v == 0.0 {
+                            "Automatic".to_string()
+                        } else {
+                            format!("{v:.1} s")
+                        }
+                    }))
+                    .on_hover_text(
+                        "How far the encoder may run ahead of or behind its bit rate (the VBV buffer), in \
+                         seconds; automatic is 0.5 s. Larger evens out the picture quality across busy and \
+                         quiet scenes and adds that much delay.",
+                    );
+                    ui.end_row();
+                    ui.label("Source buffer");
+                    ui.add(egui::DragValue::new(&mut m.buffer_s).range(0.0..=10.0).speed(0.05).custom_formatter(
+                        |v, _| {
+                            if v == 0.0 {
+                                "Automatic".to_string()
+                            } else {
+                                format!("{v:.1} s")
+                            }
+                        },
+                    ))
+                    .on_hover_text(
+                        "Encoded packets kept ready for the transmitter, in seconds; automatic is 0.5 s. \
+                         Smaller means less delay, larger rides out hiccups of the encoder or the PC.",
+                    );
+                    ui.end_row();
+                });
             });
             ui.collapsing("FFmpeg", |ui| {
                 ui.horizontal(|ui| {
@@ -503,7 +549,7 @@ impl App {
                 }
             }
             let st = s.status.lock().unwrap().clone();
-            if st.running {
+            if st.running && !st.preparing {
                 let on_air = if self.saved.dry_run { "DRY RUN" } else { "ON AIR" };
                 ui.colored_label(
                     if self.saved.dry_run { egui::Color32::from_rgb(120, 180, 240) } else { red },
@@ -516,23 +562,102 @@ impl App {
             if !st.encode.is_empty() {
                 ui.label(&st.encode);
             }
-            if st.target > 0 {
-                ui.horizontal(|ui| {
-                    ui.label("ESP buffer");
-                    ui.add(
-                        egui::ProgressBar::new(st.fill_max as f32 / st.target as f32)
-                            .desired_width(200.0)
-                            .text(format!("{}..{} of {}", st.fill_min, st.fill_max, st.target)),
+            let green = egui::Color32::from_rgb(70, 160, 90);
+            let amber = egui::Color32::from_rgb(210, 160, 50);
+            let bar = |ui: &mut egui::Ui, name: &str, frac: f32, colour: egui::Color32, text: String, note: String| {
+                ui.label(name);
+                ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).desired_width(260.0).fill(colour).text(text));
+                ui.label(note);
+                ui.end_row();
+            };
+            if st.preparing {
+                ui.colored_label(amber, format!("ENCODING THE FILE FIRST  {:.0} s (nothing is on air)", st.seconds));
+                egui::Grid::new("prep").num_columns(3).show(ui, |ui| {
+                    // 4x real time fills the bar
+                    bar(
+                        ui,
+                        "Encoder",
+                        st.enc.speed / 4.0,
+                        green,
+                        format!("{:.2}x real time, {:.0} fps", st.enc.speed, st.enc.speed * st.fps as f32),
+                        format!("{:.0} s of video done", st.enc.out_s),
                     );
-                    ui.label(format!("underruns {}", st.underruns));
                 });
-                let total = (st.pkts + st.nulls).max(1);
-                ui.label(format!(
-                    "Transport stream: {} packets from the source, {} null ({:.0} % padding)",
-                    st.pkts,
-                    st.nulls,
-                    100.0 * st.nulls as f64 / total as f64
-                ));
+            }
+            if st.target > 0 {
+                egui::Grid::new("bars").num_columns(3).show(ui, |ui| {
+                    if st.live_encode {
+                        // the middle of the bar is real time
+                        // encoders deliver in bursts: a few per cent either side of 1 is real time
+                        let (colour, note) = if st.enc.speed >= 0.93 {
+                            (green, "keeps up".to_string())
+                        } else if st.enc.speed >= 0.8 {
+                            (amber, "a little slow".to_string())
+                        } else if st.enc.speed > 0.0 {
+                            (red, "too slow: the picture will stutter. Go faster, smaller, or encode the file first".into())
+                        } else {
+                            (amber, "starting".to_string())
+                        };
+                        let frames = if st.enc.drops + st.enc.dups > 0 {
+                            format!(", {} dropped, {} repeated", st.enc.drops, st.enc.dups)
+                        } else {
+                            String::new()
+                        };
+                        bar(
+                            ui,
+                            "Encoder",
+                            st.enc.speed / 2.0,
+                            colour,
+                            format!(
+                                "{:.2}x real time, {:.0} of {} fps",
+                                st.enc.speed,
+                                (st.enc.speed * st.fps as f32).min(st.fps as f32 * 1.5),
+                                st.fps
+                            ),
+                            format!("{note}{frames}"),
+                        );
+                    }
+                    if st.queue_cap > 0 {
+                        let ms = |pk: usize| pk as f64 * 1504.0 / st.capacity.max(1.0) * 1000.0;
+                        let (colour, note) = if st.live_encode && st.queue == 0 && st.seconds > 5.0 {
+                            (amber, "empty: the encoder delivers nothing right now")
+                        } else {
+                            (green, "packets ready for the transmitter")
+                        };
+                        bar(
+                            ui,
+                            "Source buffer",
+                            st.queue as f32 / st.queue_cap as f32,
+                            colour,
+                            format!("{:.0} of {:.0} ms", ms(st.queue), ms(st.queue_cap)),
+                            note.to_string(),
+                        );
+                    }
+                    let (colour, note) = if st.underruns > 0 {
+                        (red, format!("{} underruns: USB or the PC is too slow", st.underruns))
+                    } else {
+                        (green, "no underruns".to_string())
+                    };
+                    bar(
+                        ui,
+                        "ESP buffer",
+                        st.fill_max as f32 / st.target as f32,
+                        colour,
+                        format!("{}..{} of {}", st.fill_min, st.fill_max, st.target),
+                        note,
+                    );
+                    let (colour, note) = if !st.live_encode {
+                        (green, "null packets in the last second")
+                    } else if st.padding > 60.0 && st.seconds > 8.0 {
+                        (red, "mostly null packets: the encoder is behind or has stopped")
+                    } else if st.padding < 0.5 && st.seconds > 8.0 {
+                        (amber, "no room left: the stream is running late")
+                    } else {
+                        (green, "null packets in the last second")
+                    };
+                    bar(ui, "Padding", st.padding / 100.0, colour, format!("{:.0} %", st.padding), note.to_string());
+                });
+                ui.weak(format!("Transport stream: {} packets from the source, {} null", st.pkts, st.nulls));
             }
             if !st.error.is_empty() {
                 ui.colored_label(red, &st.error);

@@ -31,8 +31,17 @@ fn main() {
         }
         shown = l.len();
         let st = s.status.lock().unwrap().clone();
-        if st.seconds >= last + 2.0 {
+        if st.preparing && st.seconds >= last + 2.0 {
             last = st.seconds;
+            println!("  encoding the file: {:.0} s of video done, {:.2}x real time", st.enc.out_s, st.enc.speed);
+        } else if st.seconds >= last + 2.0 {
+            last = st.seconds;
+            if st.live_encode {
+                println!(
+                    "  encoder {:.2}x real time; source buffer {} of {} packets; padding {:.0} %",
+                    st.enc.speed, st.queue, st.queue_cap, st.padding
+                );
+            }
             println!(
                 "  ESP buffer {}..{} of {} pairs, underruns {}, TS packets: {} from the source, {} null",
                 st.fill_min, st.fill_max, st.target, st.underruns, st.pkts, st.nulls

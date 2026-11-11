@@ -46,7 +46,8 @@ pub fn to_json(c: &TxConfig) -> Value {
         "cal": has_cal(&c.rf),
         "ffmpeg": c.media.ffmpeg, "source": c.media.source.key(), "path": c.media.path,
         "codec": c.media.codec.key(), "encoder": c.media.encoder, "width": c.media.width,
-        "fps": c.media.fps, "gop_s": c.media.gop_s, "bframes": c.media.bframes, "video_kbps": c.media.video_kbps, "speed": c.media.speed, "preview": c.preview, "audio": c.media.audio.key(), "audio_kbps": c.media.audio_kbps,
+        "fps": c.media.fps, "gop_s": c.media.gop_s, "pre_encode": c.media.pre_encode, "vbv_s": c.media.vbv_s,
+        "buffer_s": c.media.buffer_s, "bframes": c.media.bframes, "video_kbps": c.media.video_kbps, "speed": c.media.speed, "preview": c.preview, "audio": c.media.audio.key(), "audio_kbps": c.media.audio_kbps,
         "camera": c.media.camera, "microphone": c.media.microphone,
         "service_name": c.media.service_name, "provider": c.media.provider,
     })
@@ -104,6 +105,13 @@ pub fn from_json(v: &Value) -> TxConfig {
         c.media.gop_s = (x as f32).clamp(0.0, 30.0);
     }
     b("bframes", &mut c.media.bframes);
+    b("pre_encode", &mut c.media.pre_encode);
+    if let Some(x) = v["vbv_s"].as_f64() {
+        c.media.vbv_s = (x as f32).clamp(0.0, 5.0);
+    }
+    if let Some(x) = v["buffer_s"].as_f64() {
+        c.media.buffer_s = (x as f32).clamp(0.0, 10.0);
+    }
     if let Some(x) = v["fps"].as_u64() {
         c.media.fps = x.min(60) as u32;
     }
@@ -164,7 +172,7 @@ pub const USAGE: &str = "\
   --encoder NAME      FFmpeg encoder, e.g. libx265, hevc_nvenc (default: the software one)
   --speed N           encoder effort: 0 fastest .. 4 slowest (default 1)
   --no-preview        no picture of what is on air in the window
-  --audio C           sound codec: mp2, mp3, aac, opus, ac3, eac3, none
+  --audio C           sound codec: mp2, mp3, aac, heaac, heaac2, opus, ac3, eac3, none
   --audio-k N         sound bit rate in kb/s (0 = from the channel capacity)
   --film FILE         encode and loop a video file
   --test              test pattern and tone (default)
@@ -177,6 +185,9 @@ pub const USAGE: &str = "\
   --fps N             frames per second, 1..60 (0 = from the channel capacity)
   --gop S             seconds between key frames, up to 30 (0 = from the bit rate: longer when low)
   --no-bframes        no B frames (H.264 and H.265)
+  --pre-encode        --film: encode the whole file first, then transmit it (any encoder speed works)
+  --vbv S             encoder rate buffer in seconds, 0.1..5 (0 = 0.5)
+  --buffer S          packets kept ready between FFmpeg and the coder, in seconds, 0.1..10 (0 = 0.5)
   --video-k N         video bit rate in kb/s (0 = from the channel capacity)
   --name TEXT         service name
   --ffmpeg PATH       the ffmpeg to run (default: ffmpeg on PATH)
@@ -231,7 +242,7 @@ pub fn apply_args(c: &mut TxConfig, args: &[String]) -> Result<(), String> {
             "--audio" => {
                 let v = val()?;
                 c.media.audio =
-                    AudioCodec::from_key(&v).ok_or(format!("--audio {v}: mp2, mp3, aac, opus, ac3, eac3 or none"))?;
+                    AudioCodec::from_key(&v).ok_or(format!("--audio {v}: mp2, mp3, aac, heaac, heaac2, opus, ac3, eac3 or none"))?;
             }
             "--audio-k" => c.media.audio_kbps = num(k, val()?)?,
             "--film" => {
@@ -265,6 +276,9 @@ pub fn apply_args(c: &mut TxConfig, args: &[String]) -> Result<(), String> {
                 }
             }
             "--no-bframes" => c.media.bframes = false,
+            "--pre-encode" => c.media.pre_encode = true,
+            "--vbv" => c.media.vbv_s = num::<f32>(k, val()?)?.clamp(0.0, 5.0),
+            "--buffer" => c.media.buffer_s = num::<f32>(k, val()?)?.clamp(0.0, 10.0),
             "--video-k" => c.media.video_kbps = num(k, val()?)?,
             "--name" => c.media.service_name = val()?,
             "--ffmpeg" => c.media.ffmpeg = val()?,

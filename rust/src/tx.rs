@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use crate::link::{Link, SerialLink, SimLink};
 use crate::plan::{plan, start_command, AnyEncoder, RfConfig};
 use crate::preview::{Preview, Shared};
-use crate::source::{encode_plan, installed_encoders, Codec, Log, MediaConfig, SourceKind, TsSource};
+use crate::source::{
+    encode_plan, installed_encoders, pre_encode, queue_packets, Codec, EncStats, Log, MediaConfig, SourceKind, TsSource,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TxConfig {
@@ -41,6 +43,20 @@ pub struct Status {
     pub pkts: u64,
     pub nulls: u64,
     pub seconds: f64,
+    /// The file is being encoded; nothing is on air yet.
+    pub preparing: bool,
+    /// FFmpeg is encoding while transmitting (its speed matters).
+    pub live_encode: bool,
+    pub enc: EncStats,
+    /// Frames per second asked of the encoder.
+    pub fps: u32,
+    /// Packets waiting between the source and the DVB coder, and how many fit.
+    pub queue: usize,
+    pub queue_cap: usize,
+    /// Null packets in the last second, per cent.
+    pub padding: f32,
+    /// Transport stream capacity [bit/s].
+    pub capacity: f64,
 }
 
 pub struct Session {
@@ -100,18 +116,44 @@ fn run(cfg: &TxConfig, status: &Mutex<Status>, stop: &AtomicBool, log: &Log, pic
     let m = cfg.rf.modulation().to_string();
     let cw = cfg.media.source == SourceKind::Carrier;
 
+    let queue = queue_packets(p.capacity, cfg.media.buffer_s);
+    status.lock().unwrap().capacity = p.capacity;
     let mut src = match cfg.media.source {
         SourceKind::Null | SourceKind::Carrier => TsSource::null(),
-        SourceKind::TsFile => TsSource::ts_file(&cfg.media.path, log)?,
+        SourceKind::TsFile => TsSource::ts_file(&cfg.media.path, log, false, queue)?,
         _ => {
             let installed = installed_encoders(&cfg.media.ffmpeg)?;
             let ep = encode_plan(&cfg.media, p.capacity, &installed)?;
             let line = ep.summary(cfg.media.codec);
             log.push(format!("{line} (channel capacity {:.0} kb/s)", p.capacity / 1e3));
-            status.lock().unwrap().encode = line;
-            TsSource::ffmpeg(&cfg.media, &ep, log)?
+            {
+                let mut s = status.lock().unwrap();
+                s.encode = line;
+                s.fps = ep.fps;
+            }
+            if ep.pre_encode {
+                // encode all of it first: nothing is on air and the board is not opened yet
+                log.push("encoding the whole file before transmitting ...");
+                status.lock().unwrap().preparing = true;
+                let t0 = Instant::now();
+                let made = pre_encode(&cfg.media, &ep, stop, log, &mut |e| {
+                    let mut s = status.lock().unwrap();
+                    s.enc = e;
+                    s.seconds = t0.elapsed().as_secs_f64();
+                });
+                status.lock().unwrap().preparing = false;
+                let path = made?;
+                log.push(format!("encoded in {:.0} s: {path}", t0.elapsed().as_secs_f64()));
+                TsSource::ts_file(&path, log, cfg.media.codec == Codec::Av1, queue)?
+            } else {
+                status.lock().unwrap().live_encode = true;
+                TsSource::ffmpeg(&cfg.media, &ep, log, queue)?
+            }
         }
     };
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let av1 = cfg.media.source.encoded() && cfg.media.codec == Codec::Av1;
     let _preview = if cfg.preview && (cfg.media.source.encoded() || cfg.media.source == SourceKind::TsFile) {
         match Preview::start(&cfg.media.ffmpeg, av1, p.capacity, picture) {
@@ -131,6 +173,8 @@ fn run(cfg: &TxConfig, status: &Mutex<Status>, stop: &AtomicBool, log: &Log, pic
         src.tap(&cfg.ts_out)?;
     }
     let (pkts, nulls, lost) = (src.pkts.clone(), src.nulls.clone(), src.preview_lost.clone());
+    let (enc_stats, src_queued, queue_cap) = (src.stats.clone(), src.queued.clone(), src.queue_cap);
+    let (mut last_pkts, mut last_nulls) = (0u64, 0u64);
 
     let mut link: Box<dyn Link> = if cfg.dry_run {
         Box::new(SimLink::new(p.bytes_per_sec))
@@ -242,6 +286,12 @@ fn run(cfg: &TxConfig, status: &Mutex<Status>, stop: &AtomicBool, log: &Log, pic
             s.underruns = st.under;
             s.pkts = pkts.load(Ordering::Relaxed);
             s.nulls = nulls.load(Ordering::Relaxed);
+            let (dp, dn) = (s.pkts - last_pkts, s.nulls - last_nulls);
+            (last_pkts, last_nulls) = (s.pkts, s.nulls);
+            s.padding = if dp + dn > 0 { 100.0 * dn as f32 / (dp + dn) as f32 } else { 0.0 };
+            s.enc = *enc_stats.lock().unwrap();
+            s.queue = src_queued.load(Ordering::Relaxed);
+            s.queue_cap = queue_cap;
             s.seconds = t_start.elapsed().as_secs_f64();
             fmin = i64::MAX;
             fmax = 0;

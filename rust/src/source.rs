@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
@@ -74,6 +74,10 @@ pub enum AudioCodec {
     Mp2,
     Mp3,
     Aac,
+    /// HE-AAC (AAC with spectral band replication), made by libfdk_aac.
+    HeAac,
+    /// HE-AAC v2 (with parametric stereo).
+    HeAacV2,
     Opus,
     Ac3,
     Eac3,
@@ -82,10 +86,12 @@ pub enum AudioCodec {
 }
 
 impl AudioCodec {
-    pub const ALL: [AudioCodec; 7] = [
+    pub const ALL: [AudioCodec; 9] = [
         AudioCodec::Mp2,
         AudioCodec::Mp3,
         AudioCodec::Aac,
+        AudioCodec::HeAac,
+        AudioCodec::HeAacV2,
         AudioCodec::Opus,
         AudioCodec::Ac3,
         AudioCodec::Eac3,
@@ -97,6 +103,8 @@ impl AudioCodec {
             AudioCodec::Mp2 => "MPEG Layer II (MP2)",
             AudioCodec::Mp3 => "MP3",
             AudioCodec::Aac => "AAC",
+            AudioCodec::HeAac => "HE-AAC",
+            AudioCodec::HeAacV2 => "HE-AAC v2",
             AudioCodec::Opus => "Opus",
             AudioCodec::Ac3 => "Dolby Digital (AC-3)",
             AudioCodec::Eac3 => "Dolby Digital Plus (E-AC-3)",
@@ -109,6 +117,8 @@ impl AudioCodec {
             AudioCodec::Mp2 => "mp2",
             AudioCodec::Mp3 => "mp3",
             AudioCodec::Aac => "aac",
+            AudioCodec::HeAac => "heaac",
+            AudioCodec::HeAacV2 => "heaac2",
             AudioCodec::Opus => "opus",
             AudioCodec::Ac3 => "ac3",
             AudioCodec::Eac3 => "eac3",
@@ -127,6 +137,8 @@ impl AudioCodec {
             AudioCodec::Mp2 => "mp2",
             AudioCodec::Mp3 => "libmp3lame",
             AudioCodec::Aac => "aac",
+            // FFmpeg's own AAC encoder makes AAC-LC only
+            AudioCodec::HeAac | AudioCodec::HeAacV2 => "libfdk_aac",
             AudioCodec::Opus => "libopus",
             AudioCodec::Ac3 => "ac3",
             AudioCodec::Eac3 => "eac3",
@@ -145,7 +157,31 @@ impl AudioCodec {
         match self {
             AudioCodec::Opus => (kbps.clamp(6, 256), 48000),
             AudioCodec::Ac3 | AudioCodec::Eac3 => (kbps.max(32), rate.max(32000)),
+            // the band replication doubles the rate of the AAC core underneath
+            AudioCodec::HeAac | AudioCodec::HeAacV2 => (kbps.clamp(8, 128), rate.max(32000)),
             _ => (kbps, rate),
+        }
+    }
+
+    /// Options after the encoder name.
+    fn extra_args(self) -> &'static [&'static str] {
+        match self {
+            AudioCodec::HeAac => &["-profile:a", "aac_he"],
+            AudioCodec::HeAacV2 => &["-profile:a", "aac_he_v2"],
+            _ => &[],
+        }
+    }
+
+    /// Why this codec is a poor choice for a multiplex of this size, if it is. AC-3 and
+    /// E-AC-3 cannot go below 32 kb/s and are tuned for several times that: on a narrow
+    /// channel they take the bits the picture needs and still sound worse than Opus or
+    /// HE-AAC at 16 kb/s.
+    pub fn unsuited(self, mux_bps: u32) -> Option<&'static str> {
+        match self {
+            AudioCodec::Ac3 | AudioCodec::Eac3 if mux_bps < 200_000 => {
+                Some("needs at least 32 kb/s: too much of a channel under 200 kb/s")
+            }
+            _ => None,
         }
     }
 }
@@ -281,6 +317,13 @@ pub struct MediaConfig {
     pub video_kbps: u32,
     /// DirectShow device names.
     pub camera: String,
+    /// Video file: encode all of it to a transport stream before transmitting, instead of
+    /// while transmitting. The encoder may then be slower than real time.
+    pub pre_encode: bool,
+    /// Size of the encoder's rate buffer (VBV) in seconds of video bit rate; 0 = half a second.
+    pub vbv_s: f32,
+    /// Packets kept ready between FFmpeg and the DVB coder, in seconds; 0 = half a second.
+    pub buffer_s: f32,
     /// Seconds between key frames; 0 = from the bit rate (auto_gop_seconds).
     pub gop_s: f32,
     pub bframes: bool,
@@ -307,6 +350,9 @@ impl Default for MediaConfig {
             fps: 0,
             video_kbps: 0,
             camera: String::new(),
+            pre_encode: false,
+            vbv_s: 0.0,
+            buffer_s: 0.0,
             gop_s: 0.0,
             bframes: true,
             speed: DEFAULT_SPEED,
@@ -367,6 +413,66 @@ pub fn dshow_devices(ffmpeg: &str) -> (Vec<String>, Vec<String>) {
     (v, a)
 }
 
+/// How the encoder is doing, from FFmpeg's progress reports.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct EncStats {
+    /// Frames per second it encodes.
+    pub fps: f32,
+    /// Encoding speed against real time: 1 keeps up, below 1 falls behind.
+    pub speed: f32,
+    /// Seconds of video encoded so far.
+    pub out_s: f64,
+    pub drops: u64,
+    pub dups: u64,
+}
+
+/// Reads one line of `-progress` output into the statistics. False if it is something else
+/// (a message for the log).
+pub fn parse_progress(line: &str, st: &mut EncStats) -> bool {
+    let Some((k, v)) = line.split_once('=') else { return false };
+    let v = v.trim();
+    match k.trim() {
+        "fps" => st.fps = v.parse().unwrap_or(st.fps),
+        "speed" => {} // FFmpeg's figure is the average since the start: see track_progress
+        "out_time_us" => st.out_s = v.parse::<f64>().map(|u| u / 1e6).unwrap_or(st.out_s),
+        "drop_frames" => st.drops = v.parse().unwrap_or(st.drops),
+        "dup_frames" => st.dups = v.parse().unwrap_or(st.dups),
+        "frame" | "bitrate" | "total_size" | "out_time_ms" | "out_time" | "progress" => {}
+        k if k.starts_with("stream_") => {}
+        _ => return false,
+    }
+    true
+}
+
+/// Takes a line of FFmpeg's stderr: true if it was a progress report. At the end of each
+/// report the speed is worked out from the video encoded since the last one (smoothed), so
+/// it shows how the encoder is doing now.
+fn track_progress(line: &str, stats: &Mutex<EncStats>, last: &mut Option<(f64, std::time::Instant)>) -> bool {
+    let mut st = stats.lock().unwrap();
+    if !parse_progress(line, &mut st) {
+        return false;
+    }
+    if line.starts_with("progress=") {
+        let now = std::time::Instant::now();
+        match *last {
+            Some((out, t)) if now.duration_since(t).as_secs_f64() >= 0.3 => {
+                let inst = ((st.out_s - out) / now.duration_since(t).as_secs_f64()) as f32;
+                st.speed = if st.speed > 0.0 { 0.8 * st.speed + 0.2 * inst } else { inst };
+                *last = Some((st.out_s, now));
+            }
+            None if st.out_s > 0.0 => *last = Some((st.out_s, now)),
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Packets the queue between FFmpeg and the DVB coder holds for a channel capacity.
+pub fn queue_packets(capacity: f64, buffer_s: f32) -> usize {
+    let s = if buffer_s > 0.0 { buffer_s.clamp(0.1, 10.0) } else { 0.5 };
+    ((capacity / 1504.0 * s as f64) as usize).clamp(16, 20_000)
+}
+
 /// What FFmpeg is asked to make.
 #[derive(Clone, Debug)]
 pub struct EncodePlan {
@@ -381,6 +487,8 @@ pub struct EncodePlan {
     /// Frames between key frames.
     pub gop: u32,
     pub bframes: bool,
+    /// The whole file is encoded before transmitting.
+    pub pre_encode: bool,
 }
 
 impl EncodePlan {
@@ -422,6 +530,7 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
         return Err(format!("this FFmpeg has no {} encoder ({})", m.audio.label(), m.audio.encoder().unwrap_or("")));
     }
     let (aud, ar) = m.audio.fit(if m.audio_kbps > 0 { m.audio_kbps } else { aud }, ar);
+    let ach = if m.audio == AudioCodec::HeAacV2 { 2 } else { ach }; // parametric stereo needs two channels
     let aud_bps = if sound { aud * 1000 } else { 0 };
     let w = if m.width == 0 { wmax } else { m.width } / 2 * 2;
     let psi = (3.0 * 188.0 * 8.0 / pat) as i64;
@@ -448,6 +557,8 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     };
     let s = |x: &str| x.to_string();
     let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"].map(s).to_vec();
+    a.extend(["-progress", "pipe:2", "-stats_period", "0.5"].map(s));
+    let pre = m.pre_encode && m.source == SourceKind::File;
     let mut vf = format!("scale={w}:-2,fps={fps}");
     match m.source {
         SourceKind::TestPattern => {
@@ -461,7 +572,10 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
             if m.path.is_empty() {
                 return Err("choose a video file".into());
             }
-            a.extend(["-re", "-stream_loop", "-1", "-i"].map(s));
+            if !pre {
+                a.extend(["-re", "-stream_loop", "-1"].map(s));
+            }
+            a.push(s("-i"));
             a.push(m.path.clone());
         }
         SourceKind::Screen => {
@@ -494,7 +608,8 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     let g = ((gop_s * fps as f32).round() as u32).max(1);
     let bframes = m.bframes && has_bframes_option(&enc);
     let bf = if bframes { "2" } else { "0" };
-    let (mut vbs, half, kb) = (vb.to_string(), (vb / 2).to_string(), vb / 1000);
+    let vbv_s = if m.vbv_s > 0.0 { m.vbv_s.clamp(0.1, 5.0) } else { 0.5 };
+    let (mut vbs, half, kb) = (vb.to_string(), ((vb as f32 * vbv_s) as i64).to_string(), vb / 1000);
     a.push(s("-c:v"));
     a.push(enc.clone());
     let mut pix = "yuv420p";
@@ -508,7 +623,7 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
             a.push(s("-x265-params"));
             a.push(format!(
                 "log-level=error:hrd=1:vbv-maxrate={kb}:vbv-bufsize={}:keyint={g}:min-keyint={g}:bframes={bf}:repeat-headers=1",
-                (kb / 2).max(1)
+                ((kb as f32 * vbv_s) as i64).max(1)
             ));
         }
         "libvvenc" => {
@@ -543,14 +658,20 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     }
     a.extend(["-pix_fmt", pix].map(s));
     if sound {
-        a.extend(["-c:a", m.audio.encoder().unwrap_or("mp2"), "-b:a"].map(s));
+        a.extend(["-c:a", m.audio.encoder().unwrap_or("mp2")].map(s));
+        a.extend(m.audio.extra_args().iter().map(|x| s(x)));
+        a.push(s("-b:a"));
         a.push(format!("{aud}k"));
         a.extend(["-ac", &ach.to_string(), "-ar", &ar.to_string()].map(s));
     } else {
         a.push(s("-an"));
     }
+    // a file encoded ahead is sent at exactly the channel rate, so it plays in real time
     a.extend(["-f", "mpegts", "-muxrate"].map(s));
-    a.push(mux.to_string());
+    a.push(if pre { (capacity as u32).to_string() } else { mux.to_string() });
+    // the multiplexer must hold back the clock by more than the rate buffer can delay a frame
+    a.push(s("-muxdelay"));
+    a.push(format!("{:.2}", (vbv_s + 0.2).max(0.7)));
     a.extend(["-pcr_period", if aud > 50 { "40" } else { "100" }, "-pat_period"].map(s));
     a.push(pat.to_string());
     a.extend(["-mpegts_flags", "+resend_headers", "-metadata"].map(s));
@@ -558,7 +679,7 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     a.push(s("-metadata"));
     a.push(format!("service_name={}", m.service_name));
     a.push(s("-"));
-    Ok(EncodePlan { args: a, encoder: enc, width: w, fps, video_bps: vb as u32, audio_kbps: aud_bps / 1000, audio: m.audio, mux_bps: mux, gop: g, bframes })
+    Ok(EncodePlan { args: a, encoder: enc, width: w, fps, video_bps: vb as u32, audio_kbps: aud_bps / 1000, audio: m.audio, mux_bps: mux, gop: g, bframes, pre_encode: pre })
 }
 
 /// Lines for the user: FFmpeg's messages and the transmitter's own.
@@ -590,6 +711,10 @@ pub struct TsSource {
     preview: Option<SyncSender<Vec<u8>>>,
     /// Blocks of packets the preview decoder was too slow for.
     pub preview_lost: Arc<AtomicU64>,
+    pub stats: Arc<Mutex<EncStats>>,
+    /// Packets waiting between the source and the DVB coder, and how many fit.
+    pub queued: Arc<AtomicUsize>,
+    pub queue_cap: usize,
 }
 
 /// Aligns a byte stream on the 0x47 sync bytes and sends whole packets.
@@ -599,6 +724,7 @@ struct Framer {
     fix: Option<Av1Fix>,
     stop: Arc<AtomicBool>,
     out: Vec<Packet>,
+    queued: Arc<AtomicUsize>,
 }
 
 impl Framer {
@@ -621,7 +747,10 @@ impl Framer {
             for mut q in self.out.drain(..) {
                 loop {
                     match self.tx.try_send(q) {
-                        Ok(()) => break,
+                        Ok(()) => {
+                            self.queued.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
                         Err(TrySendError::Full(back)) => {
                             if self.stop.load(Ordering::Relaxed) {
                                 return false;
@@ -650,6 +779,9 @@ impl TsSource {
             tap: None,
             preview: None,
             preview_lost: Default::default(),
+            stats: Default::default(),
+            queued: Default::default(),
+            queue_cap: 0,
         }
     }
 
@@ -669,13 +801,17 @@ impl TsSource {
         self.preview = Some(to);
     }
 
-    /// A transport stream file, looped.
-    pub fn ts_file(path: &str, log: &Log) -> Result<Self, String> {
+    /// A transport stream file, looped. `av1`: FFmpeg's AV1 that still needs its carriage
+    /// rewritten (a file encoded ahead by this program). `queue`: packets kept ready.
+    pub fn ts_file(path: &str, log: &Log, av1: bool, queue: usize) -> Result<Self, String> {
         let mut f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
         let mut s = Self::empty();
-        let (tx, rx) = sync_channel(400);
+        let (tx, rx) = sync_channel(queue);
         s.rx = Some(rx);
-        let mut fr = Framer { buf: Vec::new(), tx, fix: None, stop: s.stop.clone(), out: Vec::new() };
+        s.queue_cap = queue;
+        let fix = av1.then(Av1Fix::new);
+        let mut fr =
+            Framer { buf: Vec::new(), tx, fix, stop: s.stop.clone(), out: Vec::new(), queued: s.queued.clone() };
         let (log, path) = (log.clone(), path.to_string());
         std::thread::spawn(move || {
             use std::io::Seek;
@@ -703,8 +839,8 @@ impl TsSource {
         Ok(s)
     }
 
-    /// FFmpeg encoding the configured source.
-    pub fn ffmpeg(m: &MediaConfig, plan: &EncodePlan, log: &Log) -> Result<Self, String> {
+    /// FFmpeg encoding the configured source. `queue`: packets kept ready.
+    pub fn ffmpeg(m: &MediaConfig, plan: &EncodePlan, log: &Log, queue: usize) -> Result<Self, String> {
         let mut child = hidden(Command::new(&m.ffmpeg).args(&plan.args))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -714,13 +850,20 @@ impl TsSource {
         let mut out = child.stdout.take().unwrap();
         let err = child.stderr.take().unwrap();
         let mut s = Self::empty();
-        let (tx, rx) = sync_channel(400);
+        let (tx, rx) = sync_channel(queue);
         s.rx = Some(rx);
+        s.queue_cap = queue;
         let fix = (m.codec == Codec::Av1).then(Av1Fix::new);
-        let mut fr = Framer { buf: Vec::new(), tx, fix, stop: s.stop.clone(), out: Vec::new() };
+        let mut fr =
+            Framer { buf: Vec::new(), tx, fix, stop: s.stop.clone(), out: Vec::new(), queued: s.queued.clone() };
         let l = log.clone();
+        let stats = s.stats.clone();
         std::thread::spawn(move || {
+            let mut last = None;
             for line in BufReader::new(err).lines().map_while(Result::ok) {
+                if track_progress(&line, &stats, &mut last) {
+                    continue;
+                }
                 if !line.trim().is_empty() && !line.starts_with("Svt[") {
                     l.push(format!("ffmpeg: {line}"));
                 }
@@ -757,6 +900,7 @@ impl TsSource {
             match self.rx.as_ref().and_then(|r| r.try_recv().ok()) {
                 Some(p) => {
                     out.extend_from_slice(&p);
+                    let _ = self.queued.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |q| q.checked_sub(1));
                     if self.preview.is_some() && (p[1] & 0x1F != 0x1F || p[2] != 0xFF) {
                         copy.extend_from_slice(&p);
                     }
@@ -779,6 +923,90 @@ impl TsSource {
         }
         out
     }
+}
+
+/// Encodes the whole file to a transport stream on disk and returns its path. An earlier
+/// encoding of the same file with the same settings is used again. `progress` is called a
+/// few times a second; `stop` ends it early.
+pub fn pre_encode(
+    m: &MediaConfig,
+    plan: &EncodePlan,
+    stop: &AtomicBool,
+    log: &Log,
+    progress: &mut dyn FnMut(EncStats),
+) -> Result<String, String> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(&m.path).map_err(|e| format!("{}: {e}", m.path))?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    plan.args.hash(&mut h);
+    meta.len().hash(&mut h);
+    meta.modified().ok().hash(&mut h);
+    let dir = std::env::temp_dir().join("datv-tx-cache");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let done = dir.join(format!("{:016x}.ts", h.finish()));
+    if std::fs::metadata(&done).map(|d| d.len() > 376).unwrap_or(false) {
+        log.push("this file was encoded with these settings before: using that");
+        return Ok(done.display().to_string());
+    }
+    // one file is kept: the cache does not grow
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    let part = dir.join("encoding.part");
+    // FFmpeg writes to a pipe and the file is written here: should this program die, the
+    // pipe breaks and FFmpeg ends with it instead of encoding on unseen
+    let mut file = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+    let mut child = hidden(Command::new(&m.ffmpeg).args(&plan.args))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e} (install FFmpeg or set its path)", m.ffmpeg))?;
+    let err = child.stderr.take().unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let writer = std::thread::spawn(move || std::io::copy(&mut out, &mut file).is_ok() && file.flush().is_ok());
+    let stats = Arc::new(Mutex::new(EncStats::default()));
+    let (st, l) = (stats.clone(), log.clone());
+    let reader = std::thread::spawn(move || {
+        let mut last = None;
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
+            if track_progress(&line, &st, &mut last) {
+                continue;
+            }
+            if !line.trim().is_empty() && !line.starts_with("Svt[") {
+                l.push(format!("ffmpeg: {line}"));
+            }
+        }
+    });
+    let status = loop {
+        if stop.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&part);
+            return Err("stopped while encoding the file".into());
+        }
+        progress(*stats.lock().unwrap());
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Err(e) => return Err(format!("ffmpeg: {e}")),
+        }
+    };
+    let _ = reader.join();
+    let written = writer.join().unwrap_or(false);
+    progress(*stats.lock().unwrap());
+    if !written {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("could not write {}", part.display()));
+    }
+    if !status.success() {
+        let _ = std::fs::remove_file(&part);
+        return Err("FFmpeg could not encode the file (see the messages)".into());
+    }
+    std::fs::rename(&part, &done).map_err(|e| format!("{}: {e}", done.display()))?;
+    Ok(done.display().to_string())
 }
 
 impl Drop for TsSource {
