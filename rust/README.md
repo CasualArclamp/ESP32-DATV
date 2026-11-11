@@ -37,6 +37,12 @@ capacity as in `tx_dvbs.py`, or set them yourself:
   same bit rate and needs more processor.
 - **Width** up to 1920 px (1080p) and **frame rate** up to 60 fps. The channel still carries
   what it carries: 1080p in 1 Mb/s is soft, whatever the codec.
+- **Key frames**: seconds between key frames (the GOP length), up to 30. On Automatic the
+  program spaces them by video bit rate: 2 s from 600 kb/s, 4 s from 250 kb/s, 6 s from
+  80 kb/s and 10 s below, because a key frame costs many times an ordinary frame and a
+  narrow channel has few bits to spare. The price is the wait for the first picture after
+  the receiver locks.
+- **B frames** on or off for H.264 and H.265 (the AV1 and H.266 encoders decide themselves).
 - **Sound codec** and bit rate. AC-3 and E-AC-3 need at least 32 kb/s; Opus runs at 48 kHz.
 - **Preview**: a second FFmpeg decodes a copy of the stream that goes on air and the window
   shows its picture, so you see the result of the encoding, not the source.

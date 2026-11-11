@@ -170,6 +170,25 @@ pub fn speed_args(encoder: &str, speed: u8) -> Vec<&'static str> {
     }
 }
 
+/// Seconds between key frames when the choice is left to the program. A key frame costs
+/// many times an ordinary frame, so the less the channel carries the further apart they
+/// go; the price is the time a receiver needs to show a picture after it locks.
+pub fn auto_gop_seconds(video_bps: u32) -> f32 {
+    match video_bps {
+        600_000.. => 2.0,
+        250_000.. => 4.0,
+        80_000.. => 6.0,
+        _ => 10.0,
+    }
+}
+
+/// B frames can be switched for this encoder (the others decide for themselves: SVT-AV1
+/// and libaom run without reordering for a constant bit rate, vvenc has no such option).
+pub fn has_bframes_option(encoder: &str) -> bool {
+    matches!(encoder, "libx264" | "libx265")
+        || ["_nvenc", "_qsv", "_amf"].iter().any(|s| encoder.ends_with(s)) && !encoder.starts_with("av1")
+}
+
 pub fn encoder_label(e: &str) -> String {
     let what = match e {
         "libx264" | "libx265" | "libvvenc" | "libsvtav1" | "libaom-av1" => "software",
@@ -262,6 +281,9 @@ pub struct MediaConfig {
     pub video_kbps: u32,
     /// DirectShow device names.
     pub camera: String,
+    /// Seconds between key frames; 0 = from the bit rate (auto_gop_seconds).
+    pub gop_s: f32,
+    pub bframes: bool,
     /// Encoder effort, an index into SPEEDS.
     pub speed: u8,
     pub audio: AudioCodec,
@@ -285,6 +307,8 @@ impl Default for MediaConfig {
             fps: 0,
             video_kbps: 0,
             camera: String::new(),
+            gop_s: 0.0,
+            bframes: true,
             speed: DEFAULT_SPEED,
             audio: AudioCodec::Mp2,
             audio_kbps: 0,
@@ -354,17 +378,22 @@ pub struct EncodePlan {
     pub audio_kbps: u32,
     pub audio: AudioCodec,
     pub mux_bps: u32,
+    /// Frames between key frames.
+    pub gop: u32,
+    pub bframes: bool,
 }
 
 impl EncodePlan {
     pub fn summary(&self, codec: Codec) -> String {
         format!(
-            "{} with {}: {} px wide, {} kb/s at {} fps, {}, multiplex {} kb/s",
+            "{} with {}: {} px wide, {} kb/s at {} fps, key frame every {:.1} s{}, {}, multiplex {} kb/s",
             codec.label(),
             self.encoder,
             self.width,
             self.video_bps / 1000,
             self.fps,
+            self.gop as f32 / self.fps as f32,
+            if self.bframes { ", B frames" } else { "" },
             if self.audio_kbps == 0 {
                 "no sound".to_string()
             } else {
@@ -461,7 +490,10 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
         a.push(s("-vf"));
         a.push(vf);
     }
-    let g = 2 * fps;
+    let gop_s = if m.gop_s > 0.0 { m.gop_s.clamp(0.2, 30.0) } else { auto_gop_seconds(vb as u32) };
+    let g = ((gop_s * fps as f32).round() as u32).max(1);
+    let bframes = m.bframes && has_bframes_option(&enc);
+    let bf = if bframes { "2" } else { "0" };
     let (mut vbs, half, kb) = (vb.to_string(), (vb / 2).to_string(), vb / 1000);
     a.push(s("-c:v"));
     a.push(enc.clone());
@@ -469,20 +501,20 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     a.extend(speed_args(&enc, m.speed).into_iter().map(s));
     match enc.as_str() {
         "libx264" => {
-            a.extend(["-profile:v", "main", "-bf", "2"].map(s));
+            a.extend(["-profile:v", "main", "-bf", bf].map(s));
             a.extend(["-x264-params", "nal-hrd=cbr:force-cfr=1"].map(s));
         }
         "libx265" => {
             a.push(s("-x265-params"));
             a.push(format!(
-                "log-level=error:hrd=1:vbv-maxrate={kb}:vbv-bufsize={}:keyint={g}:min-keyint={g}:bframes=2:repeat-headers=1",
+                "log-level=error:hrd=1:vbv-maxrate={kb}:vbv-bufsize={}:keyint={g}:min-keyint={g}:bframes={bf}:repeat-headers=1",
                 (kb / 2).max(1)
             ));
         }
         "libvvenc" => {
             // vvenc takes 10 bit input only; only its fastest preset keeps up beyond small pictures
             pix = "yuv420p10le";
-            a.extend(["-period", "2", "-vvenc-params"].map(s));
+            a.extend(["-period", &(gop_s.ceil() as u32).max(1).to_string(), "-vvenc-params"].map(s));
             a.push(format!("verbosity=0:maxrate={vb}"));
             // vvenc wants the maximum at least 1.5 times the target: aim lower, the channel is the maximum
             vbs = (vb * 2 / 3).to_string();
@@ -497,7 +529,12 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
         }
         e if e.ends_with("_nvenc") => {
             a.extend(["-rc", "cbr"].map(s));
+            // B frames in HEVC need a recent GPU: ask only H.264 for them, but always honour the tick being off
+            if !m.bframes || e == "h264_nvenc" {
+                a.extend(["-bf", bf].map(s));
+            }
         }
+        e if has_bframes_option(e) => a.extend(["-bf", bf].map(s)),
         _ => {}
     }
     a.extend(["-b:v", &vbs, "-g", &g.to_string()].map(s));
@@ -521,7 +558,7 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     a.push(s("-metadata"));
     a.push(format!("service_name={}", m.service_name));
     a.push(s("-"));
-    Ok(EncodePlan { args: a, encoder: enc, width: w, fps, video_bps: vb as u32, audio_kbps: aud_bps / 1000, audio: m.audio, mux_bps: mux })
+    Ok(EncodePlan { args: a, encoder: enc, width: w, fps, video_bps: vb as u32, audio_kbps: aud_bps / 1000, audio: m.audio, mux_bps: mux, gop: g, bframes })
 }
 
 /// Lines for the user: FFmpeg's messages and the transmitter's own.

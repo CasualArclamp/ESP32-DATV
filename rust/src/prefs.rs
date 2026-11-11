@@ -46,7 +46,7 @@ pub fn to_json(c: &TxConfig) -> Value {
         "cal": has_cal(&c.rf),
         "ffmpeg": c.media.ffmpeg, "source": c.media.source.key(), "path": c.media.path,
         "codec": c.media.codec.key(), "encoder": c.media.encoder, "width": c.media.width,
-        "fps": c.media.fps, "video_kbps": c.media.video_kbps, "speed": c.media.speed, "preview": c.preview, "audio": c.media.audio.key(), "audio_kbps": c.media.audio_kbps,
+        "fps": c.media.fps, "gop_s": c.media.gop_s, "bframes": c.media.bframes, "video_kbps": c.media.video_kbps, "speed": c.media.speed, "preview": c.preview, "audio": c.media.audio.key(), "audio_kbps": c.media.audio_kbps,
         "camera": c.media.camera, "microphone": c.media.microphone,
         "service_name": c.media.service_name, "provider": c.media.provider,
     })
@@ -100,6 +100,10 @@ pub fn from_json(v: &Value) -> TxConfig {
     if let Some(x) = v["width"].as_u64() {
         c.media.width = x as u32;
     }
+    if let Some(x) = v["gop_s"].as_f64() {
+        c.media.gop_s = (x as f32).clamp(0.0, 30.0);
+    }
+    b("bframes", &mut c.media.bframes);
     if let Some(x) = v["fps"].as_u64() {
         c.media.fps = x.min(60) as u32;
     }
@@ -171,6 +175,8 @@ pub const USAGE: &str = "\
   --null, --cw        null packets only, unmodulated carrier
   --width N           picture width (0 = from the channel capacity)
   --fps N             frames per second, 1..60 (0 = from the channel capacity)
+  --gop S             seconds between key frames, up to 30 (0 = from the bit rate: longer when low)
+  --no-bframes        no B frames (H.264 and H.265)
   --video-k N         video bit rate in kb/s (0 = from the channel capacity)
   --name TEXT         service name
   --ffmpeg PATH       the ffmpeg to run (default: ffmpeg on PATH)
@@ -252,6 +258,13 @@ pub fn apply_args(c: &mut TxConfig, args: &[String]) -> Result<(), String> {
                     return Err("--fps: 1 .. 60, or 0 for automatic".into());
                 }
             }
+            "--gop" => {
+                c.media.gop_s = num(k, val()?)?;
+                if !(0.0..=30.0).contains(&c.media.gop_s) {
+                    return Err("--gop: 0.2 .. 30 seconds, or 0 for automatic".into());
+                }
+            }
+            "--no-bframes" => c.media.bframes = false,
             "--video-k" => c.media.video_kbps = num(k, val()?)?,
             "--name" => c.media.service_name = val()?,
             "--ffmpeg" => c.media.ffmpeg = val()?,

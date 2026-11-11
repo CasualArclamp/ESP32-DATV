@@ -7,7 +7,7 @@
 
 use datv_tx::plan::{plan, Plan};
 use datv_tx::prefs;
-use datv_tx::source::{dshow_devices, encode_plan, encoder_label, installed_encoders, AudioCodec, Codec, Log, SourceKind, SPEEDS};
+use datv_tx::source::{dshow_devices, encode_plan, encoder_label, has_bframes_option, installed_encoders, AudioCodec, Codec, Log, SourceKind, SPEEDS};
 use datv_tx::tx::{Session, TxConfig};
 use datv_tx::{dvbs, dvbs2, link, preview};
 use eframe::egui;
@@ -352,6 +352,27 @@ impl App {
                     })
                     .response
                     .on_hover_text("Automatic: 25, 15 or 10 fps by channel capacity");
+                ui.end_row();
+                ui.label("Key frames");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut m.gop_s).range(0.0..=30.0).speed(0.1).custom_formatter(|v, _| {
+                        if v == 0.0 {
+                            "Automatic".to_string()
+                        } else {
+                            format!("every {v:.1} s")
+                        }
+                    }))
+                    .on_hover_text(
+                        "Seconds between key frames (the GOP length); drag, or double-click to type. \
+                         Automatic spaces them by bit rate: 2 s from 600 kb/s, 4 s from 250, 6 s from 80, \
+                         10 s below. Further apart leaves more bits for the picture, but a receiver \
+                         waits that long for its first picture.",
+                    );
+                    let enc = if m.encoder.is_empty() { list.first().cloned().unwrap_or_default() } else { m.encoder.clone() };
+                    ui.add_enabled(has_bframes_option(&enc), egui::Checkbox::new(&mut m.bframes, "B frames"))
+                        .on_hover_text("Better picture for the bit rate, a little more delay and decoder work")
+                        .on_disabled_hover_text("This encoder decides about B frames itself");
+                });
                 ui.end_row();
                 ui.label("Video bit rate");
                 ui.add(egui::DragValue::new(&mut m.video_kbps).range(0..=3000).custom_formatter(|v, _| {
