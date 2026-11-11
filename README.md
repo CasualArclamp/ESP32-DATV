@@ -88,6 +88,12 @@ All options: `python3 host/tx_dvbs.py --help`.
 The firmware permits 2300–2450 MHz. For on-air use, choose a frequency allowed by your
 amateur licence and add an output filter: DAC images are visible in the plots below.
 
+## Rust transmitter with a codec choice (Windows)
+
+`rust/` is a Rust port of `host/tx_dvbs.py` with a window: FFmpeg encodes the video as
+H.264, H.265 (HEVC), H.266 (VVC) or AV1, the program does the DVB-S/S2 coding (bit-identical
+to `host/dvbs.py` and `host/dvbs2.py`) and feeds the board. See [rust/README.md](rust/README.md).
+
 ## App (Linux, Windows, Android)
 
 `app/` is a standalone Flutter app that needs neither Python nor FFmpeg nor ESP-IDF. It
