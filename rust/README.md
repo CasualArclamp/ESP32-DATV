@@ -1,7 +1,7 @@
 # DATV TX (Rust, Windows)
 
 A transmitter for the ESP32-DATV firmware with a choice of video codec: **H.264, H.265 (HEVC),
-H.266 (VVC) or AV1**. It is a Rust port of `host/tx_dvbs.py`: FFmpeg encodes picture and sound
+H.266 (VVC) or AV1**, and of sound codec: **MP2, MP3, AAC, Opus, AC-3 or E-AC-3**. It is a Rust port of `host/tx_dvbs.py`: FFmpeg encodes picture and sound
 and makes the transport stream, this program does the DVB-S / DVB-S2 coding and feeds the
 ESP32-C3 over USB. The board needs the same firmware as the Flutter app and the Python script.
 
@@ -30,14 +30,22 @@ powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1   # exe\datv
 
 Choose the port, the signal (frequency, DVB-S or DVB-S2, modulation, symbol rate, FEC), the
 source (test pattern, video file, screen, camera, a ready `.ts`, null packets, carrier) and
-the codec, then press **Transmit**. Sound is MPEG Layer II. Picture size, frame rate and bit
-rates follow the channel capacity as in `tx_dvbs.py`; width and video bit rate can be set.
+the codecs, then press **Transmit**. Picture size, frame rate and bit rates follow the channel
+capacity as in `tx_dvbs.py`, or set them yourself:
+
+- **Speed**: encoder effort from Fastest to Slowest. Slower gives a better picture for the
+  same bit rate and needs more processor.
+- **Width** up to 1920 px (1080p) and **frame rate** up to 60 fps. The channel still carries
+  what it carries: 1080p in 1 Mb/s is soft, whatever the codec.
+- **Sound codec** and bit rate. AC-3 and E-AC-3 need at least 32 kb/s; Opus runs at 48 kHz.
+- **Preview**: a second FFmpeg decodes a copy of the stream that goes on air and the window
+  shows its picture, so you see the result of the encoding, not the source.
 
 **Dry run** runs everything into a simulated ESP: no board is opened and nothing is
 transmitted. `datv-tx-cli` is the same engine on the command line:
 
 ```sh
-datv-tx-cli --dry-run --seconds 10 --codec av1 --baud 1000000 --fec 2/3 --ts-out on_air.ts
+datv-tx-cli --dry-run --seconds 10 --codec av1 --audio opus --baud 1000000 --fec 2/3 --ts-out on_air.ts
 datv-tx-cli --port COM5 --freq 2402 --baud 333000 --dvbs2 --fec 2/3 --codec hevc --film film.mp4
 datv-tx-cli --help
 ```
@@ -46,8 +54,9 @@ datv-tx-cli --help
 
 - The receiver must decode the codec you choose. H.264 works everywhere; H.265 is common;
   H.266 and AV1 need a recent software receiver.
-- **H.266**: libvvenc takes 10 bit pictures only, so the stream is 10 bit. Its fastest preset
-  is used; it keeps up with the small pictures of DATV but needs a strong CPU above 640 px.
+- **H.266**: libvvenc takes 10 bit pictures only, so the stream is 10 bit. Only its fastest
+  preset (Speed at Fastest or Fast) keeps up in real time at 640 px on a fast PC, and it
+  looks ahead many frames, so at low frame rates the picture starts 10 to 15 seconds late.
 - **AV1**: FFmpeg's MPEG-TS muxer writes AV1 without any signalling, so nothing can identify
   it. `src/av1ts.rs` rewrites the stream to the AOM draft "Carriage of AV1 in MPEG-2 TS"
   (25 March 2026): registration descriptor `AV01`, AV1 video descriptor, PES stream_id 0xBD,

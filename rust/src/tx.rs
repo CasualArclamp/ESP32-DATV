@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::link::{Link, SerialLink, SimLink};
 use crate::plan::{plan, start_command, AnyEncoder, RfConfig};
-use crate::source::{encode_plan, installed_encoders, Log, MediaConfig, SourceKind, TsSource};
+use crate::preview::{Preview, Shared};
+use crate::source::{encode_plan, installed_encoders, Codec, Log, MediaConfig, SourceKind, TsSource};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TxConfig {
@@ -20,6 +21,8 @@ pub struct TxConfig {
     pub dry_run: bool,
     /// Copy the transport stream that goes on air to this file.
     pub ts_out: String,
+    /// Decode what goes on air for the picture in the window.
+    pub preview: bool,
     /// Stop after this many seconds; 0 = until stopped.
     pub seconds: f64,
 }
@@ -41,6 +44,8 @@ pub struct Status {
 }
 
 pub struct Session {
+    /// The latest picture of the on-air preview.
+    pub picture: Shared,
     pub status: Arc<Mutex<Status>>,
     pub log: Log,
     stop: Arc<AtomicBool>,
@@ -51,15 +56,17 @@ impl Session {
     pub fn start(cfg: TxConfig, log: Log) -> Session {
         let status = Arc::new(Mutex::new(Status { running: true, ..Default::default() }));
         let stop = Arc::new(AtomicBool::new(false));
+        let picture = Shared::default();
+        let pic = picture.clone();
         let (st, sp, lg) = (status.clone(), stop.clone(), log.clone());
         let thread = std::thread::spawn(move || {
-            if let Err(e) = run(&cfg, &st, &sp, &lg) {
+            if let Err(e) = run(&cfg, &st, &sp, &lg, pic) {
                 lg.push(format!("error: {e}"));
                 st.lock().unwrap().error = e;
             }
             st.lock().unwrap().running = false;
         });
-        Session { status, log, stop, thread: Some(thread) }
+        Session { picture, status, log, stop, thread: Some(thread) }
     }
 
     pub fn stop(&self) {
@@ -84,7 +91,7 @@ impl Drop for Session {
     }
 }
 
-fn run(cfg: &TxConfig, status: &Mutex<Status>, stop: &AtomicBool, log: &Log) -> Result<(), String> {
+fn run(cfg: &TxConfig, status: &Mutex<Status>, stop: &AtomicBool, log: &Log, picture: Shared) -> Result<(), String> {
     let p = plan(&cfg.rf)?;
     for n in &p.notes {
         log.push(format!("note: {n}"));
@@ -105,10 +112,25 @@ fn run(cfg: &TxConfig, status: &Mutex<Status>, stop: &AtomicBool, log: &Log) -> 
             TsSource::ffmpeg(&cfg.media, &ep, log)?
         }
     };
+    let av1 = cfg.media.source.encoded() && cfg.media.codec == Codec::Av1;
+    let _preview = if cfg.preview && (cfg.media.source.encoded() || cfg.media.source == SourceKind::TsFile) {
+        match Preview::start(&cfg.media.ffmpeg, av1, p.capacity, picture) {
+            Ok(pv) => {
+                src.preview(pv.sender());
+                Some(pv)
+            }
+            Err(e) => {
+                log.push(e);
+                None
+            }
+        }
+    } else {
+        None
+    };
     if !cfg.ts_out.is_empty() {
         src.tap(&cfg.ts_out)?;
     }
-    let (pkts, nulls) = (src.pkts.clone(), src.nulls.clone());
+    let (pkts, nulls, lost) = (src.pkts.clone(), src.nulls.clone(), src.preview_lost.clone());
 
     let mut link: Box<dyn Link> = if cfg.dry_run {
         Box::new(SimLink::new(p.bytes_per_sec))
@@ -230,6 +252,9 @@ fn run(cfg: &TxConfig, status: &Mutex<Status>, stop: &AtomicBool, log: &Log) -> 
     drop(ready_rx);
     let _ = coder.join(); // ends FFmpeg with the source
     log.push(link.finish(!p.a16s8));
+    if lost.load(Ordering::Relaxed) > 0 {
+        log.push(format!("preview: {} blocks of packets skipped (decoder behind)", lost.load(Ordering::Relaxed)));
+    }
     let mut s = status.lock().unwrap();
     s.pkts = pkts.load(Ordering::Relaxed);
     s.nulls = nulls.load(Ordering::Relaxed);

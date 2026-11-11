@@ -7,9 +7,9 @@
 
 use datv_tx::plan::{plan, Plan};
 use datv_tx::prefs;
-use datv_tx::source::{dshow_devices, encode_plan, encoder_label, installed_encoders, Codec, Log, SourceKind};
+use datv_tx::source::{dshow_devices, encode_plan, encoder_label, installed_encoders, AudioCodec, Codec, Log, SourceKind, SPEEDS};
 use datv_tx::tx::{Session, TxConfig};
-use datv_tx::{dvbs, dvbs2, link};
+use datv_tx::{dvbs, dvbs2, link, preview};
 use eframe::egui;
 
 const RATES: [u64; 7] = [33_000, 66_000, 125_000, 250_000, 333_000, 500_000, 1_000_000];
@@ -66,6 +66,9 @@ struct App {
     ports: Vec<(String, String, bool)>,
     cameras: Vec<String>,
     mics: Vec<String>,
+    /// The preview picture and the number of the one it shows.
+    picture: Option<egui::TextureHandle>,
+    picture_seq: u64,
 }
 
 impl App {
@@ -79,6 +82,8 @@ impl App {
             ports: Vec::new(),
             cameras: Vec::new(),
             mics: Vec::new(),
+            picture: None,
+            picture_seq: 0,
         };
         a.refresh_devices();
         a
@@ -103,6 +108,8 @@ impl App {
 
     fn start(&mut self) {
         self.session = None; // ends a finished one
+        self.picture = None;
+        self.picture_seq = 0;
         prefs::save(&self.cfg);
         self.saved = self.cfg.clone();
         self.log.push(if self.cfg.dry_run { "--- dry run ---" } else { "--- transmit ---" });
@@ -281,7 +288,7 @@ impl App {
 
         if m.source.encoded() {
             ui.add_space(8.0);
-            ui.heading("Video");
+            ui.heading("Video and sound");
             let installed = self.encoders.clone().unwrap_or_default();
             egui::Grid::new("video").num_columns(2).show(ui, |ui| {
                 ui.label("Codec");
@@ -311,15 +318,40 @@ impl App {
                     }
                 });
                 ui.end_row();
+                ui.label("Speed");
+
+                ui.horizontal(|ui| {
+                    ui.add(egui::Slider::new(&mut m.speed, 0..=4).show_value(false));
+                    ui.label(SPEEDS[m.speed.min(4) as usize]);
+                })
+                .response
+                .on_hover_text(
+                    "Encoder effort. Slower gives a better picture for the same bit rate but needs more \
+                     processor; if the picture stutters or the padding drops to nothing, go faster.",
+                );
+
+                ui.end_row();
                 ui.label("Width");
                 egui::ComboBox::from_id_salt("width")
                     .selected_text(if m.width == 0 { "Automatic".to_string() } else { format!("{} px", m.width) })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut m.width, 0, "Automatic");
-                        for w in [160, 320, 480, 640, 854, 960, 1280] {
+                        for w in [160, 320, 480, 640, 854, 960, 1280, 1920] {
                             ui.selectable_value(&mut m.width, w, format!("{w} px"));
                         }
                     });
+                ui.end_row();
+                ui.label("Frame rate");
+                egui::ComboBox::from_id_salt("fps")
+                    .selected_text(if m.fps == 0 { "Automatic".to_string() } else { format!("{} fps", m.fps) })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut m.fps, 0, "Automatic");
+                        for f in [5, 10, 15, 24, 25, 30, 50, 60] {
+                            ui.selectable_value(&mut m.fps, f, format!("{f} fps"));
+                        }
+                    })
+                    .response
+                    .on_hover_text("Automatic: 25, 15 or 10 fps by channel capacity");
                 ui.end_row();
                 ui.label("Video bit rate");
                 ui.add(egui::DragValue::new(&mut m.video_kbps).range(0..=3000).custom_formatter(|v, _| {
@@ -331,6 +363,27 @@ impl App {
                 }))
                     .on_hover_text("0 = as much as the channel carries");
                 ui.end_row();
+                ui.label("Sound codec");
+                egui::ComboBox::from_id_salt("audio").selected_text(m.audio.label()).width(220.0).show_ui(ui, |ui| {
+                    for c in AudioCodec::ALL {
+                        let have = c.available(&installed);
+                        let label = if have { c.label().to_string() } else { format!("{} (not in this FFmpeg)", c.label()) };
+                        ui.add_enabled_ui(have, |ui| ui.selectable_value(&mut m.audio, c, label));
+                    }
+                });
+                ui.end_row();
+                if m.audio != AudioCodec::Off {
+                    ui.label("Sound bit rate");
+                    ui.add(egui::DragValue::new(&mut m.audio_kbps).range(0..=320).custom_formatter(|v, _| {
+                        if v == 0.0 {
+                            "Automatic".to_string()
+                        } else {
+                            format!("{v:.0} kb/s")
+                        }
+                    }))
+                    .on_hover_text("Automatic: 96, 32, 16 or 8 kb/s by channel capacity (AC-3 at least 32)");
+                    ui.end_row();
+                }
                 ui.label("Service name");
                 ui.add(egui::TextEdit::singleline(&mut m.service_name).desired_width(220.0));
                 ui.end_row();
@@ -412,9 +465,22 @@ impl App {
             }
             ui.add_enabled(!running, egui::Checkbox::new(&mut self.cfg.dry_run, "Dry run (no board, no RF)"))
                 .on_hover_text("Runs FFmpeg and the DVB coder into a simulated ESP. Nothing is transmitted.");
+            ui.add_enabled(!running, egui::Checkbox::new(&mut self.cfg.preview, "Preview"))
+                .on_hover_text("Decodes a copy of the stream that goes on air and shows its picture.");
         });
         ui.add_space(8.0);
         if let Some(s) = &self.session {
+            {
+                let f = s.picture.lock().unwrap();
+                if f.seq != self.picture_seq && f.rgb.len() == preview::W * preview::H * 3 {
+                    self.picture_seq = f.seq;
+                    let img = egui::ColorImage::from_rgb([preview::W, preview::H], &f.rgb);
+                    match &mut self.picture {
+                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                        None => self.picture = Some(ui.ctx().load_texture("on air", img, egui::TextureOptions::LINEAR)),
+                    }
+                }
+            }
             let st = s.status.lock().unwrap().clone();
             if st.running {
                 let on_air = if self.saved.dry_run { "DRY RUN" } else { "ON AIR" };
@@ -449,6 +515,14 @@ impl App {
             }
             if !st.error.is_empty() {
                 ui.colored_label(red, &st.error);
+            }
+            if let Some(t) = &self.picture {
+                ui.add_space(4.0);
+                let size = egui::vec2(preview::W as f32, preview::H as f32);
+                ui.add(egui::Image::from_texture(t).fit_to_exact_size(size));
+                ui.weak("What is on air, decoded from the transmitted stream.");
+            } else if st.running && self.saved.preview && self.saved.media.source.encoded() {
+                ui.weak("Preview: waiting for the first picture...");
             }
         }
         ui.separator();

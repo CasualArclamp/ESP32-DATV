@@ -69,6 +69,107 @@ impl Codec {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioCodec {
+    Mp2,
+    Mp3,
+    Aac,
+    Opus,
+    Ac3,
+    Eac3,
+    /// No sound at all.
+    Off,
+}
+
+impl AudioCodec {
+    pub const ALL: [AudioCodec; 7] = [
+        AudioCodec::Mp2,
+        AudioCodec::Mp3,
+        AudioCodec::Aac,
+        AudioCodec::Opus,
+        AudioCodec::Ac3,
+        AudioCodec::Eac3,
+        AudioCodec::Off,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioCodec::Mp2 => "MPEG Layer II (MP2)",
+            AudioCodec::Mp3 => "MP3",
+            AudioCodec::Aac => "AAC",
+            AudioCodec::Opus => "Opus",
+            AudioCodec::Ac3 => "Dolby Digital (AC-3)",
+            AudioCodec::Eac3 => "Dolby Digital Plus (E-AC-3)",
+            AudioCodec::Off => "No sound",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            AudioCodec::Mp2 => "mp2",
+            AudioCodec::Mp3 => "mp3",
+            AudioCodec::Aac => "aac",
+            AudioCodec::Opus => "opus",
+            AudioCodec::Ac3 => "ac3",
+            AudioCodec::Eac3 => "eac3",
+            AudioCodec::Off => "none",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<AudioCodec> {
+        let k = k.to_ascii_lowercase();
+        AudioCodec::ALL.into_iter().find(|c| c.key() == k || (*c == AudioCodec::Off && k == "off"))
+    }
+
+    /// The FFmpeg encoder; None for no sound.
+    pub fn encoder(self) -> Option<&'static str> {
+        Some(match self {
+            AudioCodec::Mp2 => "mp2",
+            AudioCodec::Mp3 => "libmp3lame",
+            AudioCodec::Aac => "aac",
+            AudioCodec::Opus => "libopus",
+            AudioCodec::Ac3 => "ac3",
+            AudioCodec::Eac3 => "eac3",
+            AudioCodec::Off => return None,
+        })
+    }
+
+    pub fn available(self, installed: &[String]) -> bool {
+        self.encoder().map_or(true, |e| installed.iter().any(|i| i == e))
+    }
+
+    /// Bit rate [kb/s] and sample rate this codec can do, nearest to what the channel
+    /// budget asks for. Opus always runs at 48 kHz; AC-3 and E-AC-3 start at 32 kHz and
+    /// 32 kb/s (ATSC A/52 table 5.18 has no smaller frame).
+    fn fit(self, kbps: u32, rate: u32) -> (u32, u32) {
+        match self {
+            AudioCodec::Opus => (kbps.clamp(6, 256), 48000),
+            AudioCodec::Ac3 | AudioCodec::Eac3 => (kbps.max(32), rate.max(32000)),
+            _ => (kbps, rate),
+        }
+    }
+}
+
+/// Encoder effort, 0 (fastest) .. 4 (slowest, best picture for the bit rate).
+pub const SPEEDS: [&str; 5] = ["Fastest", "Fast", "Balanced", "Slow", "Slowest"];
+pub const DEFAULT_SPEED: u8 = 1;
+
+/// The speed setting of an encoder as FFmpeg options.
+pub fn speed_args(encoder: &str, speed: u8) -> Vec<&'static str> {
+    let i = (speed as usize).min(4);
+    let pick = |opt: &'static str, v: [&'static str; 5]| vec![opt, v[i]];
+    match encoder {
+        "libx264" | "libx265" => pick("-preset", ["ultrafast", "veryfast", "fast", "medium", "slow"]),
+        "libvvenc" => pick("-preset", ["faster", "faster", "fast", "medium", "slow"]),
+        "libsvtav1" => pick("-preset", ["12", "10", "8", "6", "4"]),
+        "libaom-av1" => pick("-cpu-used", ["10", "9", "8", "7", "6"]),
+        e if e.ends_with("_nvenc") => pick("-preset", ["p1", "p3", "p4", "p6", "p7"]),
+        e if e.ends_with("_qsv") => pick("-preset", ["veryfast", "faster", "medium", "slow", "veryslow"]),
+        e if e.ends_with("_amf") => pick("-quality", ["speed", "speed", "balanced", "quality", "quality"]),
+        _ => Vec::new(),
+    }
+}
+
 pub fn encoder_label(e: &str) -> String {
     let what = match e {
         "libx264" | "libx265" | "libvvenc" | "libsvtav1" | "libaom-av1" => "software",
@@ -155,10 +256,17 @@ pub struct MediaConfig {
     pub encoder: String,
     /// Picture width; 0 = from the channel capacity.
     pub width: u32,
+    /// Frames per second; 0 = from the channel capacity.
+    pub fps: u32,
     /// Video bit rate [kb/s]; 0 = from the channel capacity.
     pub video_kbps: u32,
     /// DirectShow device names.
     pub camera: String,
+    /// Encoder effort, an index into SPEEDS.
+    pub speed: u8,
+    pub audio: AudioCodec,
+    /// Sound bit rate [kb/s]; 0 = from the channel capacity.
+    pub audio_kbps: u32,
     /// Empty = no sound for the screen and camera sources.
     pub microphone: String,
     pub service_name: String,
@@ -174,8 +282,12 @@ impl Default for MediaConfig {
             codec: Codec::H264,
             encoder: String::new(),
             width: 0,
+            fps: 0,
             video_kbps: 0,
             camera: String::new(),
+            speed: DEFAULT_SPEED,
+            audio: AudioCodec::Mp2,
+            audio_kbps: 0,
             microphone: String::new(),
             service_name: "ESP32-C3 DATV".into(),
             provider: "ESP32-DATV".into(),
@@ -192,7 +304,7 @@ fn hidden(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
-/// Names of the video encoders the installed FFmpeg has.
+/// Names of the video and audio encoders the installed FFmpeg has.
 pub fn installed_encoders(ffmpeg: &str) -> Result<Vec<String>, String> {
     let out = hidden(Command::new(ffmpeg).args(["-hide_banner", "-encoders"]))
         .stdin(Stdio::null())
@@ -204,7 +316,7 @@ pub fn installed_encoders(ffmpeg: &str) -> Result<Vec<String>, String> {
             let mut w = l.split_whitespace();
             let flags = w.next()?;
             let name = w.next()?;
-            (flags.len() == 6 && flags.starts_with('V') && name != "=").then(|| name.to_string())
+            (flags.len() == 6 && (flags.starts_with('V') || flags.starts_with('A')) && name != "=").then(|| name.to_string())
         })
         .collect())
 }
@@ -240,19 +352,24 @@ pub struct EncodePlan {
     pub fps: u32,
     pub video_bps: u32,
     pub audio_kbps: u32,
+    pub audio: AudioCodec,
     pub mux_bps: u32,
 }
 
 impl EncodePlan {
     pub fn summary(&self, codec: Codec) -> String {
         format!(
-            "{} with {}: {} px wide, {} kb/s at {} fps, sound {} kb/s, multiplex {} kb/s",
+            "{} with {}: {} px wide, {} kb/s at {} fps, {}, multiplex {} kb/s",
             codec.label(),
             self.encoder,
             self.width,
             self.video_bps / 1000,
             self.fps,
-            self.audio_kbps,
+            if self.audio_kbps == 0 {
+                "no sound".to_string()
+            } else {
+                format!("{} sound {} kb/s", self.audio.key().to_uppercase(), self.audio_kbps)
+            },
             self.mux_bps / 1000
         )
     }
@@ -269,8 +386,13 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     } else {
         (if mux < 40_000 { 8 } else { 16 }, 1, 16000, 10, 1.0, 160)
     };
+    let fps = if m.fps > 0 { m.fps.clamp(1, 60) } else { fps };
     let live = matches!(m.source, SourceKind::Screen | SourceKind::Camera);
-    let sound = !live || !m.microphone.is_empty();
+    let sound = m.audio != AudioCodec::Off && (!live || !m.microphone.is_empty());
+    if sound && !m.audio.available(installed) {
+        return Err(format!("this FFmpeg has no {} encoder ({})", m.audio.label(), m.audio.encoder().unwrap_or("")));
+    }
+    let (aud, ar) = m.audio.fit(if m.audio_kbps > 0 { m.audio_kbps } else { aud }, ar);
     let aud_bps = if sound { aud * 1000 } else { 0 };
     let w = if m.width == 0 { wmax } else { m.width } / 2 * 2;
     let psi = (3.0 * 188.0 * 8.0 / pat) as i64;
@@ -344,36 +466,37 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     a.push(s("-c:v"));
     a.push(enc.clone());
     let mut pix = "yuv420p";
+    a.extend(speed_args(&enc, m.speed).into_iter().map(s));
     match enc.as_str() {
         "libx264" => {
-            a.extend(["-preset", "veryfast", "-profile:v", "main", "-bf", "2"].map(s));
+            a.extend(["-profile:v", "main", "-bf", "2"].map(s));
             a.extend(["-x264-params", "nal-hrd=cbr:force-cfr=1"].map(s));
         }
         "libx265" => {
-            a.extend(["-preset", "veryfast", "-x265-params"].map(s));
+            a.push(s("-x265-params"));
             a.push(format!(
                 "log-level=error:hrd=1:vbv-maxrate={kb}:vbv-bufsize={}:keyint={g}:min-keyint={g}:bframes=2:repeat-headers=1",
                 (kb / 2).max(1)
             ));
         }
         "libvvenc" => {
-            // vvenc takes 10 bit input only; its fastest preset keeps up with small pictures
+            // vvenc takes 10 bit input only; only its fastest preset keeps up beyond small pictures
             pix = "yuv420p10le";
-            a.extend(["-preset", "faster", "-period", "2", "-vvenc-params"].map(s));
+            a.extend(["-period", "2", "-vvenc-params"].map(s));
             a.push(format!("verbosity=0:maxrate={vb}"));
             // vvenc wants the maximum at least 1.5 times the target: aim lower, the channel is the maximum
             vbs = (vb * 2 / 3).to_string();
         }
         "libsvtav1" => {
-            a.extend(["-preset", "10", "-svtav1-params"].map(s));
+            a.push(s("-svtav1-params"));
             a.push(s("rc=2:pred-struct=1:lookahead=0"));
             vbs = (vb * 9 / 10).to_string(); // the constant bit rate mode of SVT-AV1 runs about a tenth over
         }
         "libaom-av1" => {
-            a.extend(["-cpu-used", "9", "-usage", "realtime", "-lag-in-frames", "0", "-end-usage", "cbr"].map(s));
+            a.extend(["-usage", "realtime", "-lag-in-frames", "0", "-end-usage", "cbr"].map(s));
         }
         e if e.ends_with("_nvenc") => {
-            a.extend(["-preset", "p4", "-rc", "cbr"].map(s));
+            a.extend(["-rc", "cbr"].map(s));
         }
         _ => {}
     }
@@ -383,7 +506,7 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     }
     a.extend(["-pix_fmt", pix].map(s));
     if sound {
-        a.extend(["-c:a", "mp2", "-b:a"].map(s));
+        a.extend(["-c:a", m.audio.encoder().unwrap_or("mp2"), "-b:a"].map(s));
         a.push(format!("{aud}k"));
         a.extend(["-ac", &ach.to_string(), "-ar", &ar.to_string()].map(s));
     } else {
@@ -398,7 +521,7 @@ pub fn encode_plan(m: &MediaConfig, capacity: f64, installed: &[String]) -> Resu
     a.push(s("-metadata"));
     a.push(format!("service_name={}", m.service_name));
     a.push(s("-"));
-    Ok(EncodePlan { args: a, encoder: enc, width: w, fps, video_bps: vb as u32, audio_kbps: aud_bps / 1000, mux_bps: mux })
+    Ok(EncodePlan { args: a, encoder: enc, width: w, fps, video_bps: vb as u32, audio_kbps: aud_bps / 1000, audio: m.audio, mux_bps: mux })
 }
 
 /// Lines for the user: FFmpeg's messages and the transmitter's own.
@@ -427,6 +550,9 @@ pub struct TsSource {
     pub pkts: Arc<AtomicU64>,
     pub nulls: Arc<AtomicU64>,
     tap: Option<std::fs::File>,
+    preview: Option<SyncSender<Vec<u8>>>,
+    /// Blocks of packets the preview decoder was too slow for.
+    pub preview_lost: Arc<AtomicU64>,
 }
 
 /// Aligns a byte stream on the 0x47 sync bytes and sends whole packets.
@@ -485,6 +611,8 @@ impl TsSource {
             pkts: Default::default(),
             nulls: Default::default(),
             tap: None,
+            preview: None,
+            preview_lost: Default::default(),
         }
     }
 
@@ -497,6 +625,11 @@ impl TsSource {
     pub fn tap(&mut self, path: &str) -> Result<(), String> {
         self.tap = Some(std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?);
         Ok(())
+    }
+
+    /// Sends a copy of the packets (without the null packets) to the preview decoder.
+    pub fn preview(&mut self, to: SyncSender<Vec<u8>>) {
+        self.preview = Some(to);
     }
 
     /// A transport stream file, looped.
@@ -582,16 +715,26 @@ impl TsSource {
     /// n packets, null packets where the source has none ready.
     pub fn take(&mut self, n: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(188 * n);
+        let mut copy = Vec::new();
         for _ in 0..n {
             match self.rx.as_ref().and_then(|r| r.try_recv().ok()) {
                 Some(p) => {
                     out.extend_from_slice(&p);
+                    if self.preview.is_some() && (p[1] & 0x1F != 0x1F || p[2] != 0xFF) {
+                        copy.extend_from_slice(&p);
+                    }
                     self.pkts.fetch_add(1, Ordering::Relaxed);
                 }
                 None => {
                     out.extend_from_slice(&NULL_PACKET);
                     self.nulls.fetch_add(1, Ordering::Relaxed);
                 }
+            }
+        }
+        if let (Some(to), false) = (&self.preview, copy.is_empty()) {
+            if to.try_send(copy).is_err() {
+                // a preview that is behind loses packets, the air does not
+                self.preview_lost.fetch_add(1, Ordering::Relaxed);
             }
         }
         if let Some(f) = &mut self.tap {

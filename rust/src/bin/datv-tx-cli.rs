@@ -6,6 +6,7 @@ use datv_tx::tx::Session;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut c = default_config();
+    c.preview = false; // no window to show it in
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         println!("datv-tx-cli: ESP32-DATV transmitter. Amateur radio use only, within your licence.\n{USAGE}");
         return;
